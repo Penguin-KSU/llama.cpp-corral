@@ -35,7 +35,7 @@ app 本身也很轻:单一二进制、零第三方依赖、无后台服务、不
 ## 安装(从源码构建)
 
 ```sh
-git clone https://github.com/penguin122056291-web/llama.cpp-corral
+git clone https://github.com/Penguin-KSU/llama.cpp-corral
 cd llama.cpp-corral
 ./build.sh        # 产物 Corral.app,无需 Xcode,swiftc 零依赖
 ```

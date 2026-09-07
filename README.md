@@ -42,7 +42,7 @@ Your llama.cpp source/binary and model files are left exactly as they were.
 ## Installation (build from source)
 
 ```sh
-git clone https://github.com/penguin122056291-web/llama.cpp-corral
+git clone https://github.com/Penguin-KSU/llama.cpp-corral
 cd llama.cpp-corral
 ./build.sh        # produces Corral.app; no Xcode needed, plain swiftc
 ```
