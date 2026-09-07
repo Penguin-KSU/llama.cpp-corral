@@ -1,0 +1,5 @@
+Corral.app/
+logs/
+settings/
+.router-preset.ini
+.DS_Store
