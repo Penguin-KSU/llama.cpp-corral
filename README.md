@@ -68,8 +68,10 @@ cd llama.cpp-corral
 ## Model parameter files (`*.llm`)
 
 One file per model, `key = value` format; keys are llama.cpp command-line
-option names. **Model id = file name without the `.llm` suffix.** Left-empty
-parameters are not written, so llama.cpp uses its official defaults.
+option names. **Model id = file name without the `.llm` suffix** (always the
+GGUF's real name); an optional `# display-name: My Model` comment line adds a
+display-only alias in the UI. Left-empty parameters are not written, so
+llama.cpp uses its official defaults.
 
 ```ini
 model              = /path/to/your-model.gguf

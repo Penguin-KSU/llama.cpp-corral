@@ -58,7 +58,7 @@ cd llama.cpp-corral
 ## 模型参数文件(`*.llm`)
 
 每个文件对应一个模型,`key = value` 格式,键名即 llama.cpp 命令行参数名。
-**模型 id = 文件名去掉 `.llm` 后缀**。留空的参数不写,由 llama.cpp 使用官方默认值。
+**模型 id = 文件名去掉 `.llm` 后缀**(恒为 GGUF 真名);可加一行 `# display-name: 别名` 注释设置仅用于界面显示的别名。留空的参数不写,由 llama.cpp 使用官方默认值。
 
 ```ini
 model              = /path/to/your-model.gguf

@@ -139,8 +139,13 @@ struct Settings {
 struct ModelEntry {
     let name: String   // filename in config/
     let path: String
-    // model id = filename without the .llm extension (stable router id)
+    // model id = filename without the .llm extension. The filename is
+    // always the GGUF's real name (migrateConfigFiles renames legacy
+    // files), so the id is stable and visible to external tools.
+    // The optional "# display-name:" comment is display-only.
     var id: String { name.hasSuffix(CONFIG_EXT) ? String(name.dropLast(CONFIG_EXT.count)) : name }
+    var displayName: String { LlmFile.read(path).displayName }
+    var label: String { displayName.isEmpty ? id : displayName }
 }
 
 func loadModelEntries() -> [ModelEntry] {
@@ -159,11 +164,47 @@ func buildPresetFile() {
         // not a llama.cpp argument
         let body = ((try? String(contentsOfFile: m.path, encoding: .utf8)) ?? "")
             .components(separatedBy: "\n")
-            .filter { !$0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("# pinned:") }
+            .filter { line -> Bool in
+                let t = line.trimmingCharacters(in: .whitespaces).lowercased()
+                // app-private metadata lines: stay out of the router preset
+                return !t.hasPrefix("# pinned:") && !t.hasPrefix("# display-name:")
+            }
             .joined(separator: "\n")
         out += "\n[\(m.id)]\n" + body + "\n"
     }
     try? out.write(toFile: PRESET_FILE, atomically: true, encoding: .utf8)
+}
+
+// One-time migration: config files used to be named after the optional
+// custom name, which made the custom name the live router model id.
+// Now the id is always the GGUF's real name; the old name moves into a
+// "# display-name:" comment. Returns log messages (may be empty).
+func migrateConfigFiles() -> [String] {
+    var msgs: [String] = []
+    guard let names = try? FileManager.default.contentsOfDirectory(atPath: CONFIG_DIR) else { return msgs }
+    for name in names where name.hasSuffix(CONFIG_EXT) {
+        let id = String(name.dropLast(CONFIG_EXT.count))
+        let path = CONFIG_DIR + "/" + name
+        let f = LlmFile.read(path)
+        guard let modelPath = f.values["model"], !modelPath.isEmpty else { continue }
+        let gguf = URL(fileURLWithPath: modelPath).deletingPathExtension().lastPathComponent
+        if gguf.isEmpty || gguf == id { continue }
+        let target = CONFIG_DIR + "/" + gguf + CONFIG_EXT
+        guard !FileManager.default.fileExists(atPath: target) else {
+            msgs.append("config migration: \(name) -> \(gguf) skipped (target exists)")
+            continue
+        }
+        var text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        if f.displayName.isEmpty { text += "# display-name: \(id)\n" }
+        do {
+            try text.write(toFile: target, atomically: true, encoding: .utf8)
+            try FileManager.default.removeItem(atPath: path)
+            msgs.append("config migration: \(name) -> \(gguf) (display name kept)")
+        } catch {
+            msgs.append("config migration failed for \(name): \(error.localizedDescription)")
+        }
+    }
+    return msgs
 }
 
 // MARK: - Icons
@@ -433,6 +474,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         log = LogSink(file: LOG_FILE)
         log.onLine = { [weak self] line in self?.appendLogLine(line) }
 
+        // rename legacy config files (custom-name filenames) to the
+        // GGUF's real name before the first preset build
+        for msg in migrateConfigFiles() { appendLogLine("[menubar] " + msg) }
+
         // 激活到前台: app 常被 nohup/开机自启在后台拉起, 后台状态下
         // Dock 右键菜单的「退出」不响应 —— 启动即激活, Dock 菜单随时可用
         NSApp.activate(ignoringOtherApps: true)
@@ -574,7 +619,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func rebuildModelsSubmenu() {
         modelsSubmenu.removeAllItems()
         for m in loadModelEntries() {
-            let item = NSMenuItem(title: m.id, action: nil, keyEquivalent: "")
+            let item = NSMenuItem(title: m.label, action: nil, keyEquivalent: "")
             item.state = loadedNames.contains(m.id) ? .on : .off
             let sub = NSMenu()
             let act: NSMenuItem

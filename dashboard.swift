@@ -282,6 +282,9 @@ struct LlmFile {
     var values: [String: String]
     var order: [String]      // key order as written to the file
     var pinned: [String]
+    // display-only alias ("# display-name:" comment); the router model
+    // id is always the GGUF's real name, never this
+    var displayName = ""
 
     static func parse(_ text: String) -> LlmFile {
         var f = LlmFile(values: [:], order: [], pinned: [])
@@ -294,6 +297,9 @@ struct LlmFile {
                         .split(separator: ",")
                         .map { $0.trimmingCharacters(in: .whitespaces) }
                         .filter { !$0.isEmpty && PARAM_INDEX[$0] != nil }
+                } else if lower.hasPrefix("# display-name:") {
+                    f.displayName = String(line.dropFirst("# display-name:".count))
+                        .trimmingCharacters(in: .whitespaces)
                 }
                 continue
             }
@@ -320,6 +326,7 @@ struct LlmFile {
         for k in order {
             if let v = values[k], !v.isEmpty { out += k + " = " + v + "\n" }
         }
+        if !displayName.isEmpty { out += "# display-name: " + displayName + "\n" }
         if !pinned.isEmpty { out += "# pinned: " + pinned.joined(separator: ", ") + "\n" }
         return out
     }
@@ -374,7 +381,7 @@ final class FormModel: ObservableObject {
     @Published var order: [String]
     @Published var pinned: [String]
     @Published var ggufPath = ""     // "model" key (add/edit modes)
-    @Published var customName = ""   // add mode only
+    @Published var customName = ""   // display-only alias (add + edit modes)
     @Published var errorMessage: String?
     @Published var justSaved = false
     // version-C section cards: collapsed by default, user expands what
@@ -399,13 +406,14 @@ final class FormModel: ObservableObject {
             values = f.values; order = f.order
             pinned = f.pinned.isEmpty ? DEFAULT_PINS : f.pinned
             ggufPath = f.values["model"] ?? ""
+            customName = f.displayName
         }
     }
 
-    // model id = custom name, or GGUF filename without extension
+    // model id = always the GGUF filename without extension (stable,
+    // visible to external tools); the custom name is display-only
     var targetID: String {
-        if !customName.isEmpty { return customName }
-        return URL(fileURLWithPath: ggufPath).deletingPathExtension().lastPathComponent
+        URL(fileURLWithPath: ggufPath).deletingPathExtension().lastPathComponent
     }
 
     // single write path for parameter values: keeps `order` in sync.
@@ -441,10 +449,10 @@ final class FormModel: ObservableObject {
         case .add:
             let id = targetID
             guard !id.isEmpty else { return T("模型路径必填") }
-            try? LlmFile(values: v, order: o, pinned: pinned).text()
+            try? LlmFile(values: v, order: o, pinned: pinned, displayName: customName).text()
                 .write(toFile: CONFIG_DIR + "/" + id + CONFIG_EXT, atomically: true, encoding: .utf8)
         case .edit(let id):
-            try? LlmFile(values: v, order: o, pinned: pinned).text()
+            try? LlmFile(values: v, order: o, pinned: pinned, displayName: customName).text()
                 .write(toFile: CONFIG_DIR + "/" + id + CONFIG_EXT, atomically: true, encoding: .utf8)
         }
         return nil
@@ -666,13 +674,12 @@ struct FormView: View {
                           chevron: false, isOpen: true)
             if fm.mode == .add || fm.mode.isEdit {
                 fixedFieldRow("model", value: $fm.ggufPath, placeholder: T("GGUF 文件路径(必填)"), browse: true)
-                if fm.mode == .add {
-                    fixedFieldRow(T("自定义名称"), value: $fm.customName, placeholder: T("留空 = 取文件名"), browse: false)
-                    if !fm.targetID.isEmpty {
-                        Text(TF("将保存为 config/%@.llm", fm.targetID))
-                            .font(.caption).foregroundStyle(.secondary)
-                            .padding(.leading, 12).padding(.bottom, 4)
-                    }
+                // 显示别名: 只影响 UI 显示, 模型 ID 恒为 GGUF 真名
+                fixedFieldRow(T("自定义名称"), value: $fm.customName, placeholder: T("留空 = 显示文件名"), browse: false)
+                if fm.mode == .add, !fm.targetID.isEmpty {
+                    Text(TF("将保存为 config/%@.llm", fm.targetID))
+                        .font(.caption).foregroundStyle(.secondary)
+                        .padding(.leading, 12).padding(.bottom, 4)
                 }
             }
             if pinnedRows.isEmpty && canPin {
@@ -854,7 +861,7 @@ struct ModelsPage: View {
                 Picker("", selection: modelSelection) {
                     Text(T("选择模型…")).tag(String?.none)
                     ForEach(dm.modelEntries, id: \.id) { m in
-                        Text(m.id + (dm.loadedIDs.contains(m.id) ? T(" · 已加载") : "")).tag(String?.some(m.id))
+                        Text(m.label + (dm.loadedIDs.contains(m.id) ? T(" · 已加载") : "")).tag(String?.some(m.id))
                     }
                 }
                 .labelsHidden()
@@ -987,7 +994,7 @@ struct ModelsPage: View {
             return
         }
         let alert = NSAlert()
-        alert.messageText = TF("删除模型 %@", m.id)
+        alert.messageText = TF("删除模型 %@", m.label)
         alert.informativeText = T("确认删除参数配置(不会删除模型本体)")
         alert.addButton(withTitle: T("确认"))
         alert.addButton(withTitle: T("取消"))

@@ -125,7 +125,7 @@ let enDict: [String: String] = [
     "基本 · 置顶": "Basic · Pinned",
     "GGUF 文件路径(必填)": "GGUF file path (required)",
     "自定义名称": "Custom Name",
-    "留空 = 取文件名": "empty = use file name",
+    "留空 = 显示文件名": "empty = show file name",
     "将保存为 config/%@.llm": "Will be saved as config/%@.llm",
     "点参数行右侧的图钉,把常用参数置顶到这里": "Click the pin on a row to move frequently used parameters here",
     "%d 项 · %d 已设置": "%d items · %d set",
