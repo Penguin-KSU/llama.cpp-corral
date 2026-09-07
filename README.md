@@ -2,7 +2,7 @@
 
 [中文](README-zh.md) | English
 
-A macOS menu bar app that manages **your own** [llama.cpp](https://github.com/ggml-org/llama.cpp)
+A macOS menu bar app that manages your [llama.cpp](https://github.com/ggml-org/llama.cpp)
 router (`llama-server serve`) — load and unload multiple models with one click,
 no more typing the same commands every time.
 
@@ -13,9 +13,12 @@ no more typing the same commands every time.
 - Multi-model management: one `*.llm` parameter file per model, one-click
   load/unload from the menu bar
 - Native SwiftUI dashboard: visual editing of model parameters (~210
-  llama-server options, frequently used ones pinnable), llama.cpp environment
-  detection / upgrade / branch management, live logs, settings (port, API
-  endpoint list)
+  llama-server options, frequently used ones pinnable), live logs, settings
+  (port, API endpoint list)
+- llama.cpp build management: detects what you have, adopts and switches
+  between multiple local builds (official prebuilt / self-built / fork),
+  upgrades with one click (source builds: pull + rebuild + auto-restart),
+  and manages branches
 - Chinese / English UI (switch in Settings; follows the system language by default)
 - Optional start-at-login
 

@@ -2,15 +2,19 @@
 
 English | 中文
 
-macOS 桌面版菜单栏应用:管理你**自己编译的** [llama.cpp](https://github.com/ggml-org/llama.cpp)
-router(`llama-server serve`),多模型一键加载/卸载,不用每次都敲命令行。
+macOS 菜单栏应用:管理你**已有的** [llama.cpp](https://github.com/ggml-org/llama.cpp)
+router(`llama-server serve`,官方预编译版或自编译版均可),
+多模型一键加载/卸载,不用每次都敲命令行。
 
 ## 功能
 
 - 菜单栏常驻,自动启动 llama.cpp router,意外退出自动重启,残留进程/端口冲突自动检测清理
 - 多模型管理:每个模型一个 `*.llm` 参数文件,菜单栏一键加载/卸载
 - 原生 SwiftUI 控制面板:模型参数可视化编辑(~210 个 llama-server 参数,常用参数可置顶)、
-  llama.cpp 环境检测/升级/分支管理、实时日志、设置(端口、API 端点列表)
+  实时日志、设置(端口、API 端点列表)
+- llama.cpp 编译版管理:自动检测已有安装,接入并切换多个本地编译版
+  (官方预编译版/自编译版/fork),一键升级(源码版 pull + 重编 + 自动重启),
+  分支管理
 - 中/英双语界面(设置页切换,默认跟随系统语言)
 - 开机启动(可选)
 
