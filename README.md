@@ -20,6 +20,10 @@ no more typing the same commands every time.
   upgrades with one click (source builds: pull + rebuild + auto-restart),
   and manages branches
 - Chinese / English UI (switch in Settings; follows the system language by default)
+- Experimental (off by default): an audio-transcoding proxy that lets
+  dictation apps recording WebM/Opus (e.g. OpenWhispr) use llama.cpp's
+  transcription API, which only reads WAV/MP3/FLAC — toggle it on the
+  dashboard's Experimental page (requires ffmpeg: `brew install ffmpeg`)
 - Optional start-at-login
 
 ## Zero intrusion into llama.cpp
@@ -33,7 +37,9 @@ models over the HTTP API. All of its own data lives in its own data directory
 
 The app itself is light: a single binary, zero third-party dependencies, no
 background services, and it listens on no port of its own (the port belongs to
-the llama.cpp router).
+the llama.cpp router) — the single exception is the opt-in experimental
+audio-transcoding proxy, which fronts that port while enabled and moves the
+router to an internal one.
 
 **Uninstall**: quit the app → delete `Corral.app` → delete
 `~/Library/Application Support/Corral/` (skip this step to keep your configs).
@@ -49,13 +55,15 @@ cd llama.cpp-corral
 
 ## Prerequisites
 
-- macOS 13+
+- macOS 14+
 - llama.cpp installed (official prebuilt or self-built). The dashboard's
   Environment page detects it automatically and can guide installation
   (official one-click install / build from source), upgrade it, or switch
   branches; an existing build in another location can be adopted there.
   On first use, confirm the `bin` directory (e.g.
   `/path/to/llama.cpp/build/bin`) and port on the Settings page.
+- (only for the experimental audio-transcoding feature) ffmpeg:
+  `brew install ffmpeg`
 
 ## Usage
 
@@ -104,6 +112,7 @@ All user data lives in the standard macOS location (created on first launch):
 main.swift          AppKit core (settings / process management / router API)
 dashboard.swift     dashboard (SwiftUI)
 l10n.swift          zh/en strings (Chinese keys + English dictionary)
+proxy.swift         experimental audio-transcoding proxy (opt-in)
 icon.swift          status bar icon
 build.sh            build script (one-line swiftc)
 icons/              pre-rendered AppIcon.icns + status bar PNGs

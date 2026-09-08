@@ -16,6 +16,9 @@ router(`llama-server serve`,官方预编译版或自编译版均可),
   (官方预编译版/自编译版/fork),一键升级(源码版 pull + 重编 + 自动重启),
   分支管理
 - 中/英双语界面(设置页切换,默认跟随系统语言)
+- 实验性功能(默认关闭):音频转码代理 —— 让录 WebM/Opus 的听写软件
+  (如 OpenWhispr)能用上 llama.cpp 的转写 API(它只认 WAV/MP3/FLAC);
+  控制面板「实验性功能」页开关,需 ffmpeg(`brew install ffmpeg`)
 - 开机启动(可选)
 
 ## 对 llama.cpp 零侵入
@@ -26,7 +29,8 @@ Corral **从不修改 llama.cpp 的任何文件** —— 不写进源码目录�
 数据目录里(见下)。
 
 app 本身也很轻:单一二进制、零第三方依赖、无后台服务、不监听任何端口
-(端口是 llama.cpp router 的)。
+(端口是 llama.cpp router 的;唯一例外是可选开启的实验性音频转码代理,
+开启时它顶在该端口前、router 退到内部端口)。
 
 **卸载**:退出 app → 删除 `Corral.app` → 删除
 `~/Library/Application Support/Corral/`(想保留配置就不删这一步)。
@@ -42,11 +46,12 @@ cd llama.cpp-corral
 
 ## 前置要求
 
-- macOS 13+
+- macOS 14+
 - 已安装llama.cpp(官方预编译版或自行编译均可)。控制面板「环境」页会自动检测,
   未安装时可引导安装(官方一键安装 / 源码编译),已安装时可升级/切换分支;
   已有其他位置的编译版可在该页「接入」。首次使用请在「设置」页确认
   `bin` 目录(如 `/path/to/llama.cpp/build/bin`)和端口。
+- (仅实验性音频转码功能需要)ffmpeg:`brew install ffmpeg`
 
 ## 使用
 
@@ -91,6 +96,7 @@ top-p              = 0.95
 main.swift          AppKit 主体(设置/进程管理/router API)
 dashboard.swift     控制面板(SwiftUI)
 l10n.swift          中/英文案(中文当 key + 英文字典)
+proxy.swift         实验性音频转码代理(可选开启)
 icon.swift          状态栏图标
 build.sh            构建脚本(swiftc 一行编译)
 icons/              预渲染的 AppIcon.icns + 状态栏 PNG

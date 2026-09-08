@@ -345,7 +345,7 @@ final class LogStore: ObservableObject {
 
 // MARK: - Navigation state
 
-enum DashPage: Hashable { case models, upgrade, logs, settings }
+enum DashPage: Hashable { case models, upgrade, logs, settings, experimental }
 enum ModelsTab: Hashable { case global, add, list }
 
 // NOTE: no @State anywhere in this file — @State is macro-based in the
@@ -925,7 +925,7 @@ struct ModelsPage: View {
         .padding(.horizontal, 0)
         .padding(.top, 12)
         .padding(.bottom, 50)
-        .onChange(of: dm.selectedModel) { _ in dm.form = nil }
+        .onChange(of: dm.selectedModel) { dm.form = nil }
         .onAppear { refreshEntries() }
     }
 
@@ -1972,7 +1972,7 @@ struct EnvPage: View {
             }
             .frame(maxHeight: 140)
             .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
-            .onChange(of: lines.count) { _ in
+            .onChange(of: lines.count) {
                 proxy.scrollTo("tail", anchor: .bottom)
             }
         }
@@ -2058,7 +2058,7 @@ struct LogsPage: View {
                     .id("tail")
             }
             .padding(50)
-            .onChange(of: store.lines.count) { _ in
+            .onChange(of: store.lines.count) {
                 proxy.scrollTo("tail", anchor: .bottom)
             }
         }
@@ -2215,7 +2215,7 @@ struct SettingsPage: View {
                     TextField(T("127.0.0.1(留空 = 默认)"), text: $m.host)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(m.host.isEmpty ? Color.secondary : .primary)
-                        .onChange(of: m.host) { _ in m.saved = false }
+                        .onChange(of: m.host) { m.saved = false }
                 }
                 HStack {
                     Text(T("端口")).frame(width: 120, alignment: .leading)
@@ -2223,7 +2223,7 @@ struct SettingsPage: View {
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(m.port.isEmpty ? Color.secondary : .primary)
                         .frame(width: 100)
-                        .onChange(of: m.port) { _ in m.saved = false }
+                        .onChange(of: m.port) { m.saved = false }
                     Button(T("确认")) {
                         app.saveConnection(host: m.host, port: Int(m.port))   // empty/invalid = default 8080
                         m.saved = true
@@ -2345,7 +2345,7 @@ struct SettingsPage: View {
             }
             .frame(maxHeight: 140)
             .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
-            .onChange(of: lines.count) { _ in
+            .onChange(of: lines.count) {
                 proxy.scrollTo("tail", anchor: .bottom)
             }
         }
@@ -2393,6 +2393,75 @@ struct SettingsPage: View {
 
 // MARK: - Root view + window host
 
+// MARK: - Experimental page (实验性功能)
+// 代理常驻公开端口, 这里的开关只控制「接不接红灯泡」, 即时生效、
+// 不重启 router、不动已加载模型(见 docs/experimental/实验性扩展-语音转文字.md)
+struct ExperimentalPage: View {
+    let app: AppDelegate
+    @ObservedObject var l10n = L10n.shared   // re-render on language switch
+    @ObservedObject var proxyState = ProxyState.shared   // re-render on switch toggle
+
+    var body: some View {
+        ScrollView {
+            // spacing 44 = 两张灰底卡片各凸出 14pt(负 vertical padding)后, 留 16pt 可见间隙
+            VStack(alignment: .leading, spacing: 44) {
+                // 顶部总描述: 讲清"实验性"是什么(适用所有实验功能)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(T("实验性功能")).font(.headline)
+                    Text(T("这里的功能是测试性质的:可能不稳定、可能有 bug、默认全部关闭,且只做了有限测试,不保证在所有场景下都正常工作。如果你不使用相关功能,请保持关闭;如果开启后出现问题,直接关闭对应功能即可恢复原有行为,不会损坏模型或数据。"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.primary.opacity(0.06))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.10)))
+                        .padding(.horizontal, -50)
+                        .padding(.vertical, -14)
+                )
+
+                // 实验功能卡片: 音频转码(每个实验功能一张独立卡片)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(T("音频转码")).font(.headline)
+                    Text(T("让本地语音转写支持 WebM 等格式")).font(.system(size: 11)).foregroundStyle(.secondary)
+                    Toggle(T("音频转码代理"), isOn: Binding(
+                        get: { proxyState.enabled },
+                        set: { proxyState.enabled = $0; app.confirmAudioProxy($0) }))
+                    Text(T("为什么有这个功能:llama.cpp 的本地语音转写只认 WAV / MP3 / FLAC 三种音频,而 OpenWhispr 等听写软件录的是 WebM/Opus,两者对不上、直接转写会报 400。本功能在中间实时把 WebM 等转成 ASR 能读的 16kHz 单声道 WAV。"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text(T("为什么是实验性:目前只在 OpenWhispr 上验证过;对其他听写软件大概率可用,但未逐一测试、不保证效果。不使用语音转写软件请保持关闭(默认关闭)。"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    HStack {
+                        Text(T("监听端口")).frame(width: 120, alignment: .leading)
+                        Text(TF("与设置页连接端口一致(当前 %d)", app.currentPublicPort))
+                            .font(.system(size: 11, design: .monospaced))
+                    }
+                    HStack {
+                        Text("ffmpeg").frame(width: 120, alignment: .leading)
+                        if let p = app.ffmpegPath {
+                            Text(p).font(.system(size: 11, design: .monospaced))
+                                .textSelection(.enabled)
+                        } else {
+                            Text(T("未找到 — 请安装: brew install ffmpeg"))
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.primary.opacity(0.10))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.14)))
+                        .padding(.horizontal, -50)
+                        .padding(.vertical, -14)
+                )
+            }
+            .padding(50)
+        }
+    }
+}
+
 struct DashboardView: View {
     @ObservedObject var model: DashboardModel
     @ObservedObject var l10n = L10n.shared   // re-render on language switch
@@ -2411,6 +2480,7 @@ struct DashboardView: View {
                 Label(T("环境"), systemImage: "arrow.up.circle").tag(DashPage.upgrade)
                 Label(T("日志"), systemImage: "text.alignleft").tag(DashPage.logs)
                 Label(T("设置"), systemImage: "gear").tag(DashPage.settings)
+                Label(T("实验性功能"), systemImage: "flask").tag(DashPage.experimental)
             }
             .listStyle(.sidebar)
             .toolbar(removing: .sidebarToggle)
@@ -2420,6 +2490,7 @@ struct DashboardView: View {
             case .upgrade:  EnvPage(app: app, runner: app.upgradeRunner)
             case .logs:     LogsPage(store: logStore)
             case .settings: SettingsPage(app: app)
+            case .experimental: ExperimentalPage(app: app)
             }
         }
         .navigationSplitViewStyle(.balanced)

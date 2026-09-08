@@ -31,6 +31,15 @@ let CONFIG_EXT  = ".llm"
 var g_sigtermRequested = false
 func sigtermHandler(_ sig: Int32) { g_sigtermRequested = true }
 
+// Observable mirror of the audio-proxy switch so the dashboard toggle
+// re-renders immediately (AppDelegate is not an ObservableObject; the
+// authoritative value stays in settings.audioProxy)
+final class ProxyState: ObservableObject {
+    static let shared = ProxyState()
+    @Published var enabled = false
+    private init() { enabled = Settings.load().audioProxy }
+}
+
 // MARK: - Settings
 
 // 我已有其他编译版 tab 的已录用条目: 目录 + 可选显示名
@@ -49,6 +58,7 @@ struct Settings {
     var port: Int? = nil   // nil = llama.cpp official default (8080); shown empty/gray in the UI
     var pinnedEndpoints: [String] = []   // 设置页 API 端点「置顶」(应用级,与模型无关)
     var lang = ""          // UI language: "zh" / "en"; empty = follow system (see L10n)
+    var audioProxy = false // 实验性功能: 音频转码代理开关(默认关)
 
     static func load() -> Settings {
         var s = Settings()
@@ -72,6 +82,7 @@ struct Settings {
                     .filter { !$0.isEmpty }
             }
             if k == "lang", !v.isEmpty { s.lang = v }
+            if k == "audio-proxy" { s.audioProxy = (v == "on") }
             if k == "managed-src", !v.isEmpty { s.managedSrc = v }
             if k == "sources" {
                 // one entry per line: "<path>::<name>" (name may be empty).
@@ -95,6 +106,7 @@ struct Settings {
         if let p = port { out += "port: \(p)\n" }
         if !pinnedEndpoints.isEmpty { out += "pinned-endpoints: \(pinnedEndpoints.joined(separator: ", "))\n" }
         if !lang.isEmpty { out += "lang: \(lang)\n" }
+        out += "audio-proxy: \(audioProxy ? "on" : "off")\n"
         if !managedSrc.isEmpty { out += "managed-src: \(managedSrc)\n" }
         for e in sources { out += "sources: \(e.path)\(e.name.isEmpty ? "" : "::" + e.name)\n" }
         try? out.write(toFile: SETTINGS_FILE, atomically: true, encoding: .utf8)
@@ -462,6 +474,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var modelsSubmenu: NSMenu!
     var loginItem: NSMenuItem!
+    // 实验性功能(音频转码代理): 常驻公开端口, router 用内部临时端口
+    var proxy: AudioProxy?
+    var routerInternalPort = 0
     let dashboard = DashboardApp()
     let logStore = LogStore()
     let upgradeRunner = UpgradeRunner()
@@ -501,6 +516,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // on the port and the next launch shows the leftover modal. The
         // signal handler can only set a flag; the 3s timer acts on it.
         signal(SIGTERM, sigtermHandler)
+        // a network client vanishing mid-response must not kill the app
+        signal(SIGPIPE, SIG_IGN)
 
         setupStatusItem()
 
@@ -729,6 +746,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // process fail to bind the port and crash-loop until the recovery
         // logic eventually kills the old tree (the 反复崩溃 false alarm)
         proc.stop()
+        stopProxy()
         startRouter()
         return nil
     }
@@ -750,12 +768,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // 一键更新收尾: 先停 router(释放端口, 新实例的 router 才能直接绑定),
-    // 拉起新 app, 旧实例稍后退出。本地构建的 bundle 无隔离属性, 可直接启动
+    // 拉起新 app, 旧实例稍后退出。本地构建的 bundle 无隔离属性, 可直接启动。
+    // 必须用 `open -n`: NSWorkspace.open 对"已在运行"的 app 只会激活现有实例
+    // (同一 bundle id), 于是下面的 terminate 会把 app 直接关掉而不是重启;
+    // -n 强制开一个新实例, 新二进制才真正起来。
     func relaunchSelf() {
         proc.stop()
+        stopProxy()
         loadedNames = []
         updateIcon()
-        NSWorkspace.shared.open(Bundle.main.bundleURL)
+        let task = Process()
+        task.launchPath = "/usr/bin/open"
+        task.arguments = ["-n", Bundle.main.bundlePath]
+        try? task.run()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             NSApp.terminate(nil)
         }
@@ -770,6 +795,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.bin = dir
         settings.save()
         proc.stop()
+        stopProxy()
         startRouter()
     }
 
@@ -859,6 +885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loadedNames = []
         updateIcon()
         proc.stop()
+        stopProxy()
         startRouter()
     }
 
@@ -975,8 +1002,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             appendLogLine("[menubar] no llama executable at \(exe) — router not started")
             return
         }
-        var args = ["serve"]
-        if let p = settings.port { args += ["--port", String(p)] }
+        // 音频转码开关决定拓扑:
+        //   ON  → router 用内部端口, 代理占公开端口(代理路径)
+        //   OFF → router 直接监听公开端口, 不起代理(与发布版完全一致)
+        var port: Int
+        if settings.audioProxy {
+            if routerInternalPort == 0 {
+                guard let p = pickFreePort() else {
+                    appendLogLine("[menubar] could not pick an internal port for the router")
+                    return
+                }
+                routerInternalPort = p
+            }
+            port = routerInternalPort
+        } else {
+            port = currentPublicPort
+        }
+        var args = ["serve", "--port", String(port)]
         args += ["--models-preset", PRESET_FILE]
         if !settings.host.isEmpty { args += ["--host", settings.host] }
         if let err = proc.start(executable: exe, args: args, cwd: settings.bin, log: log) {
@@ -997,7 +1039,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         routerUp = true
         unhealthyPolls = 0
         routerStartedAt = Date()
+        if settings.audioProxy { startProxy() }
     }
+
+    // 代理跟 router 同生命周期: 仅开关 ON 时 router 起来才起, 重启/换端口时随 router 换绑
+    func startProxy() {
+        guard proxy == nil else { return }
+        let a = AudioProxy(publicPort: currentPublicPort,
+                           routerPort: routerInternalPort, log: appendLogLine)
+        if let err = a.start() {
+            appendLogLine("[menubar] proxy start failed: \(err)")
+            let alert = NSAlert()
+            alert.messageText = T("音频转码代理启动失败")
+            alert.informativeText = err
+            alert.runModal()
+            return
+        }
+        proxy = a
+    }
+
+    func stopProxy() {
+        proxy?.stop()
+        proxy = nil
+    }
+
+    // 实验性功能页开关(乐观 UI): Toggle 的 set 先把 ProxyState 翻过去(勾立即变),
+    // 再调这里弹确认框。确认 = 保存 + 重启 router(有模型先卸);取消 = 勾回弹。
+    func confirmAudioProxy(_ on: Bool) {
+        let alert = NSAlert()
+        alert.messageText = T("音频转码代理")
+        let verb = T(on ? "启用" : "停用")
+        alert.informativeText = TF("将%@音频转码代理,需要重启 router,已加载的模型会先卸载。确认继续吗?", verb)
+        alert.addButton(withTitle: T("确认"))
+        alert.addButton(withTitle: T("取消"))
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            ProxyState.shared.enabled = !on   // 回弹到原状态
+            return
+        }
+        settings.audioProxy = on
+        settings.save()
+        ProxyState.shared.enabled = on
+        appendLogLine("[proxy] audio transcoding \(on ? "enabled" : "disabled") — restarting router")
+        loadedNames = []
+        updateIcon()
+        proc.stop()
+        stopProxy()
+        startRouter()
+    }
+
+    var currentPublicPort: Int { settings.port ?? 8080 }
+    var ffmpegPath: String? { AudioProxy.findFFmpeg() }
 
     var refreshing = false
 
@@ -1230,6 +1321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loadedNames = []
         updateIcon()
         proc.stop()
+        stopProxy()
         startRouter()
     }
 
@@ -1274,6 +1366,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // even if the router would not unload its children itself.
         timer?.invalidate()
         routerDead = true
+        stopProxy()
         proc.stop()
     }
 
