@@ -143,7 +143,22 @@ final class AudioProxy {
             dead = true
             readSrc?.cancel()
             owner?.conns.remove(self)
-            SocketUtil.shutdownAndClose(fd)
+            // Defer fd teardown to the write queue: chunks are enqueued
+            // on wq per recv, and the EOF that triggers this close arrives
+            // on the serial queue right behind the last data event. A
+            // synchronous shutdown+close here races the final queued
+            // sendAll and silently drops the tail of the stream — the
+            // client then sees a truncated chunked body (undici: "terminated",
+            // pi auto-retries). Ordering the teardown after pending sends
+            // on wq guarantees the last bytes (SSE [DONE] + terminating
+            // chunk) are flushed first.
+            // [fd] captures the fd value only (no self): Conn may be
+            // deallocated before the teardown runs; deinit then sees
+            // dead == true and skips, so the wq task is the one and
+            // only closer of this fd
+            wq.async { [fd] in
+                SocketUtil.shutdownAndClose(fd)
+            }
         }
     }
 
