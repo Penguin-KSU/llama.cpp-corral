@@ -2300,7 +2300,7 @@ struct SettingsPage: View {
             // 无更新 = 灰色禁用按钮, 有更新 = 蓝色可用; 一键更新 = git pull +
             // ./build.sh, 成功后自动退出并拉起新 app
             VStack(alignment: .leading, spacing: 10) {
-                Text(T("更新")).font(.headline)
+                Text(T("Corral 更新")).font(.headline)
                 HStack {
                     if !m.updateLine.isEmpty {
                         Text(m.updateLine)

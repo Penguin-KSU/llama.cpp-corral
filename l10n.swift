@@ -81,6 +81,7 @@ let enDict: [String: String] = [
     "杀掉": "Kill",
     "取消": "Cancel",
     "更新": "Update",
+    "Corral 更新": "Corral Update",
     "更新 Corral": "Update Corral",
     "更新完成后 app 将自动重启,router 会短暂中断并卸载所有已加载的模型,确认继续吗?": "When the update finishes, the app restarts itself — the router is briefly interrupted and all loaded models are unloaded. Continue?",
     "无法定位源码目录(本 app 不在 git clone 中),请重新下载最新源码并运行 ./build.sh": "Source directory not found (this app is not in a git clone) — download the latest source and run ./build.sh",
