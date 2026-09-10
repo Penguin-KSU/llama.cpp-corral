@@ -29,6 +29,14 @@ final class AudioProxy {
     // lifetime trap).
     private var conns: Set<Conn> = []
 
+    // dial-failure log rate limit (audit D13): with the router down for
+    // a while, the 3s health poll turns one failure into ~2880 identical
+    // lines/hour. Log the first failure, stay silent while it continues,
+    // log one recovery line when a dial succeeds — the pair brackets the
+    // outage. Only touched on the serial queue (pipeToRouter always runs
+    // on it), no lock needed
+    private var routerDialFailing = false
+
     init(publicPort: Int, routerPort: Int, log: @escaping (String) -> Void) {
         self.publicPort = publicPort
         self.routerPort = routerPort
@@ -411,10 +419,17 @@ final class AudioProxy {
     private func pipeToRouter(_ c: Conn, first: Data) {
         let rfd = SocketUtil.dial(port: routerPort)
         guard rfd >= 0 else {
-            log("[proxy] router dial failed")
+            if !routerDialFailing {
+                log("[proxy] router dial failed")
+                routerDialFailing = true
+            }
             sendAll(c, Self.httpError(502, "router unreachable"))
             c.close()
             return
+        }
+        if routerDialFailing {
+            log("[proxy] router reachable again")
+            routerDialFailing = false
         }
         setNonBlocking(rfd)
         let r = Conn(rfd)

@@ -27,6 +27,7 @@ let GLOBAL_FILE   = SETTINGS_DIR + "/global.llm" // dashboard: global param temp
 let CONFIG_DIR  = ROOT + "/config"
 let LOG_DIR     = ROOT + "/logs"
 let LOG_FILE    = LOG_DIR + "/router.log"
+let APP_LOG_FILE = LOG_DIR + "/app.log"   // app 自己的行为(menubar/proxy/dashboard), router.log 只留给 router 本体
 let PRESET_FILE = ROOT + "/.router-preset.ini"
 let CONFIG_EXT  = ".llm"
 // set by the SIGTERM handler so the app can shut down cleanly (and stop the
@@ -216,26 +217,59 @@ func migrateConfigFiles() -> [String] {
 
 // MARK: - Log sink
 
+// rotated-file date stamp (shared with the history helpers below)
+private let logDateFmt: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd"
+    return f
+}()
+
 final class LogSink {
     private let queue = DispatchQueue(label: "logsink")
+    private let filePath: String
     private var fh: FileHandle?
     private var pending = Data()
+    // calendar day this live file started; drives date rollover (see rotate)
+    private var day: Date
     var onLine: ((String) -> Void)?
 
+    // Rotation policy (2026-09, mirrors oMLX's logging_config.py with
+    // Corral's own numbers): roll at midnight AND when the live file hits
+    // 50MB (same-day size splits get .1/.2 suffixes); rotated files older
+    // than 5 days are pruned. Deliberately fixed, not a setting.
+    private static let maxLiveBytes = 50 * 1024 * 1024
+    private static let retentionDays = 5
+
     init(file: String) {
+        filePath = file
         try? FileManager.default.createDirectory(atPath: LOG_DIR, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: file) {
             try? "".write(toFile: file, atomically: false, encoding: .utf8)
+        }
+        // The live file's start day = its last-modification day (writes keep
+        // it current); an empty file counts as "started today". Tracking the
+        // day in memory also catches an app that sat idle over midnight and
+        // writes its first line days later (oMLX's TimedRotatingFileHandler
+        // has exactly this hole: no write after midnight => no rotation
+        // until the process restarts)
+        let cal = Calendar.current
+        let attrs = (try? FileManager.default.attributesOfItem(atPath: file)) ?? [:]
+        if let m = attrs[.modificationDate] as? Date, (attrs[.size] as? Int ?? 0) > 0 {
+            day = cal.startOfDay(for: m)
+        } else {
+            day = cal.startOfDay(for: Date())
         }
         fh = FileHandle(forWritingAtPath: file)
         // forWritingAtPath opens at offset 0, NOT at the end: without this,
         // every app launch would overwrite the oldest log content in place
         // (the file silently loses everything older than the newest session)
         fh?.seekToEndOfFile()
+        pruneRotated()
     }
 
     func append(_ data: Data) {
         queue.async {
+            self.maybeRotate()
             self.fh?.write(data)
             self.pending.append(data)
             // cap the line buffer: a newline-free stretch (e.g. a \r progress
@@ -256,6 +290,95 @@ final class LogSink {
             }
         }
     }
+
+    // Rotation runs on `queue` (append is the only caller), so no extra
+    // synchronization around fh.
+    private func maybeRotate() {
+        let today = Calendar.current.startOfDay(for: Date())
+        let size = ((try? FileManager.default.attributesOfItem(atPath: filePath))?[.size] as? Int) ?? 0
+        let oversized = size >= Self.maxLiveBytes
+        guard today != day || oversized else { return }
+        rotate()
+        day = today
+    }
+
+    private func rotate() {
+        fh?.closeFile()
+        fh = nil
+        let dir = (filePath as NSString).deletingLastPathComponent
+        let name = (filePath as NSString).lastPathComponent
+        // <name>.YYYY-MM-DD; same-day size splits append .1, .2, ...
+        var target = dir + "/" + name + "." + logDateFmt.string(from: day)
+        var part = 1
+        while FileManager.default.fileExists(atPath: target) {
+            target = dir + "/" + name + "." + logDateFmt.string(from: day) + "." + String(part)
+            part += 1
+        }
+        try? FileManager.default.moveItem(atPath: filePath, toPath: target)
+        try? "".write(toFile: filePath, atomically: false, encoding: .utf8)
+        fh = FileHandle(forWritingAtPath: filePath)
+        pruneRotated()
+    }
+
+    // Drop rotated files whose date is older than the retention window
+    // (keeps the last `retentionDays` rotated days + today's live file).
+    private func pruneRotated() {
+        let dir = (filePath as NSString).deletingLastPathComponent
+        let prefix = (filePath as NSString).lastPathComponent + "."
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return }
+        let cal = Calendar.current
+        let cutoff = cal.date(byAdding: .day, value: -Self.retentionDays, to: cal.startOfDay(for: Date()))!
+        for e in entries where e.hasPrefix(prefix) {
+            // the date is the first component after "<name>." (splits add more)
+            let datePart = e.dropFirst(prefix.count).split(separator: ".").first.map(String.init) ?? ""
+            if let d = logDateFmt.date(from: datePart), d < cutoff {
+                try? FileManager.default.removeItem(atPath: dir + "/" + e)
+            }
+        }
+    }
+}
+
+// MARK: - Log history (rotated files, read-only snapshots)
+
+// Rotated days available for a log file, newest first. Today is never
+// listed — today IS the live view.
+func logHistoryDays(forFile file: String) -> [String] {
+    let prefix = (file as NSString).lastPathComponent + "."
+    let today = logDateFmt.string(from: Date())
+    guard let entries = try? FileManager.default.contentsOfDirectory(atPath: LOG_DIR) else { return [] }
+    var days = Set<String>()
+    for e in entries where e.hasPrefix(prefix) {
+        let d = e.dropFirst(prefix.count).split(separator: ".").first.map(String.init) ?? ""
+        if d != today, logDateFmt.date(from: d) != nil { days.insert(d) }
+    }
+    return days.sorted(by: >)
+}
+
+// The newest rotated file for a day (same-day size splits: highest .N
+// wins, bare <name>.<date> = part 0). nil if the day has no files.
+func logHistoryFile(forFile file: String, day: String) -> String? {
+    let base = (file as NSString).lastPathComponent
+    let dir = (file as NSString).deletingLastPathComponent
+    let prefix = base + "." + day
+    guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return nil }
+    var best: String?
+    var bestPart = -1
+    for e in entries where e.hasPrefix(prefix) {
+        let rest = e.dropFirst(prefix.count)
+        let part: Int
+        if rest.isEmpty { part = 0 }
+        else if rest.hasPrefix("."), let n = Int(rest.dropFirst()) { part = n }
+        else { continue }
+        if part > bestPart { bestPart = part; best = dir + "/" + e }
+    }
+    return best
+}
+
+// Tail `n` lines of a file (history view is a snapshot; a day's file is
+// capped at ~50MB per split, so a full read is bounded).
+func logTailLines(_ path: String, n: Int) -> [String] {
+    guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+    return Array(s.components(separatedBy: "\n").suffix(n))
 }
 
 // MARK: - Router process
@@ -479,6 +602,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var api: RouterAPI { RouterAPI(port: currentPublicPort, host: currentPublicHost) }
     var proc = RouterProc()
     var log: LogSink!
+    var appLog: LogSink!   // appendLogLine 的落盘去向(只写文件, 不挂 onLine 防双写 UI)
     var statusItem: NSStatusItem!
     var timer: Timer?
 
@@ -519,7 +643,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var proxy: AudioProxy?
     var routerInternalPort = 0
     let dashboard = DashboardApp()
-    let logStore = LogStore()
+    // 两个店对应落盘的两份文件: router 本体输出 / app 自己的行为
+    let routerLogStore = LogStore()
+    let appLogStore = LogStore()
+    // 日志页面板状态(暂停滚动/历史模式/选中日期): 挂 app 主体, 切页不销毁
+    lazy var logPageModel = LogPageModel()
     let upgradeRunner = UpgradeRunner()
     // 页面状态记录本: 挂在 app 主体上, 切页不销毁(曾在页面视图的
     // @StateObject 上, 切走即丢: 用户输入/事件记录没了, 进行中的编译
@@ -533,7 +661,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings = Settings.load()
 
         log = LogSink(file: LOG_FILE)
-        log.onLine = { [weak self] line in self?.appendLogLine(line) }
+        log.onLine = { [weak self] line in self?.appendRouterLine(line) }
+        appLog = LogSink(file: APP_LOG_FILE)
 
         // rename legacy config files (custom-name filenames) to the
         // GGUF's real name before the first preset build
@@ -1500,8 +1629,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return f
     }()
 
+    // router 本体输出行: 只进 UI 的 router 店; 落盘由 LogSink 直接写
+    // router.log, 不能再经 appendLogLine(会把 router 输出双写进 app.log)
+    func appendRouterLine(_ line: String) {
+        routerLogStore.append("[\(Self.logTimestamp.string(from: Date()))] \(line)")
+    }
+
+    // app 自己的行为(menubar/proxy/dashboard): UI + app.log 双写。
+    // 持久化定案(2026-09): app 重启后事件记录不能只剩内存里的日志页;
+    // 与 router.log 分文件, router.log 保持 router 本体的纯净输出
     func appendLogLine(_ line: String) {
-        logStore.append("[\(Self.logTimestamp.string(from: Date()))] \(line)")
+        let stamped = "[\(Self.logTimestamp.string(from: Date()))] \(line)"
+        appLogStore.append(stamped)
+        appLog.append(Data((stamped + "\n").utf8))
     }
 
     // MARK: helpers

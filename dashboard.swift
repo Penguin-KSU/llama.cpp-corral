@@ -915,6 +915,15 @@ struct ModelsPage: View {
                 TextField(T("搜索参数…(如 temp / gpu / cache)"), text: $dm.searchText)
                     .textFieldStyle(.roundedBorder)
                     .controlSize(.large)
+                // 一键清空: 非空才显示。独立按钮放框外(不叠在框内,
+                // 否则悬停时底下文本框的 I 型光标会透出来)
+                if !dm.searchText.isEmpty {
+                    Button { dm.searchText = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding(10)
             .padding(.horizontal, 50)   // 顶栏留 50; 卡片所在 ScrollView 通到窗口边
@@ -2048,6 +2057,14 @@ struct EnvPage: View {
                         TextField(T("搜索分支…"), text: $m.branchSearch)
                             .textFieldStyle(.roundedBorder)
                             .frame(maxWidth: 260)
+                        // 一键清空: 非空才显示, 框外独立按钮(与模型页参数搜索框同款)
+                        if !m.branchSearch.isEmpty {
+                            Button { m.branchSearch = "" } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
                         Spacer()
                         // 图例: 说清 +/− 的基准, 避免"跟谁比"的歧义
                         if !m.currentBranch.isEmpty {
@@ -2270,25 +2287,184 @@ struct EnvPage: View {
     }
 }
 
-// MARK: - Logs page (migrated from the old AppKit log window)
+// MARK: - Logs page
+
+// Per-panel state. Lives in LogPageModel (AppDelegate-owned, like
+// envModel/settingsModel) so page switches don't drop it.
+final class LogPanelModel: ObservableObject {
+    @Published var paused = false            // 暂停滚动
+    @Published var historyMode = false       // 查找历史
+    @Published var days: [String] = []       // rotated days, newest first
+    @Published var day: String? = nil        // selected day (historyMode only)
+    @Published var historyLines: [String] = []
+    @Published var hint = false              // 「默认状态」点击提示, 2s 自灭
+
+    func refreshDays(_ file: String) { days = logHistoryDays(forFile: file) }
+
+    func toggleHistory(_ file: String) {
+        refreshDays(file)
+        if historyMode {
+            historyMode = false
+            day = nil
+            historyLines = []
+            return
+        }
+        guard let d = days.first else { return }   // 还没有轮转文件
+        historyMode = true
+        selectDay(d, file: file)
+    }
+
+    func selectDay(_ d: String, file: String) {
+        day = d
+        historyLines = logHistoryFile(forFile: file, day: d).map { logTailLines($0, n: 4000) } ?? []
+    }
+
+    func openDayFile(_ file: String) {
+        guard let d = day, let p = logHistoryFile(forFile: file, day: d) else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: p))
+    }
+
+    // 回默认: 今天的实时视图 + 自动滚动
+    func reset() {
+        historyMode = false
+        day = nil
+        historyLines = []
+        paused = false
+        hint = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.hint = false }
+    }
+}
+
+final class LogPageModel: ObservableObject {
+    let router = LogPanelModel()
+    let app = LogPanelModel()
+}
 
 struct LogsPage: View {
-    @ObservedObject var store: LogStore
+    let app: AppDelegate
 
     var body: some View {
-        ScrollViewReader { proxy in
+        ScrollView {
+            VStack(spacing: 24) {
+                LogPanel(m: app.logPageModel.router, store: app.routerLogStore,
+                         file: LOG_FILE, title: "Router Log")
+                LogPanel(m: app.logPageModel.app, store: app.appLogStore,
+                         file: APP_LOG_FILE, title: "App Log")
+            }
+            .padding(50)
+        }
+        .onAppear {
+            // 轮转文件只在跨天/超体积时新增, 打开页面刷新一次足够
+            app.logPageModel.router.refreshDays(LOG_FILE)
+            app.logPageModel.app.refreshDays(APP_LOG_FILE)
+        }
+    }
+}
+
+// 一个日志面板: 按钮行 + (历史模式下的日期行) + 400pt 日志区
+struct LogPanel: View {
+    @ObservedObject var m: LogPanelModel
+    @ObservedObject var store: LogStore
+    @ObservedObject var l10n = L10n.shared   // re-render on language switch
+    let file: String
+    let title: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                Spacer()
+                segButton(T("暂停滚动"), on: m.paused, disabled: m.historyMode) { m.paused.toggle() }
+                // 文件夹紧贴「查找历史」成一对: 历史模式下打开所选天最新分片
+                // 的全文(实时视图下置灰: 今天的文件还在写)
+                HStack(spacing: 2) {
+                    segButton(T("查找历史"), on: m.historyMode, disabled: m.days.isEmpty && !m.historyMode) { m.toggleHistory(file) }
+                    Button { m.openDayFile(file) } label: {
+                        Image(systemName: "folder")
+                            .font(.system(size: 13))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.10)))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!m.historyMode || m.day == nil)
+                }
+                // 与历史单元拉开距离, 三个大按钮整体靠左一点点
+                segButton(T("默认状态"), on: false, disabled: !m.historyMode && !m.paused) { m.reset() }
+                    .padding(.leading, 24)
+            }
+            if m.historyMode {
+                HStack(spacing: 6) {
+                    ForEach(m.days, id: \.self) { d in
+                        Button { m.selectDay(d, file: file) } label: {
+                            Text(d)
+                                .font(.system(size: 12, design: .monospaced))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 3)
+                                .background(RoundedRectangle(cornerRadius: 5)
+                                    .fill(m.day == d ? Color.accentColor : Color.primary.opacity(0.10)))
+                                .foregroundStyle(m.day == d ? .white : .primary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            if m.hint {
+                Text(T("实时日志 + 自动滚动"))
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+            content
+                .frame(height: 400)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.15)))
+        }
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if m.historyMode {
+            // 只读快照: 文件已封口, 无自动滚动
             ScrollView {
-                Text(store.lines.joined(separator: "\n"))
+                Text(m.historyLines.joined(separator: "\n"))
                     .font(.system(size: 11, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .id("tail")
             }
-            .padding(50)
-            .onChange(of: store.lines.count) {
-                proxy.scrollTo("tail", anchor: .bottom)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(store.lines.joined(separator: "\n"))
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .id("tail")
+                }
+                .onChange(of: store.lines.count) {
+                    if !m.paused { proxy.scrollTo("tail", anchor: .bottom) }
+                }
+                .onChange(of: m.paused) {
+                    // 取消暂停 = 回到实时尾部
+                    if !m.paused { proxy.scrollTo("tail", anchor: .bottom) }
+                }
             }
         }
+    }
+
+    // 分段语义: 选中 = 实心蓝底白字, 未选中 = 朴素(与模型页顶栏同款)。
+    // 整体 1.2 倍(2026-09 用户定): 字号 15.6 / 内边距 14.4,4.8 / 圆角 7.2
+    private func segButton(_ label: String, on: Bool, disabled: Bool,
+                           action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 15.6))
+                .padding(.horizontal, 14.4)
+                .padding(.vertical, 4.8)
+                .background(RoundedRectangle(cornerRadius: 7.2)
+                    .fill(on ? Color.accentColor : Color.primary.opacity(0.10)))
+                .foregroundStyle(on ? .white : .primary)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
     }
 }
 
@@ -2730,7 +2906,6 @@ struct ExperimentalPage: View {
 struct DashboardView: View {
     @ObservedObject var model: DashboardModel
     @ObservedObject var l10n = L10n.shared   // re-render on language switch
-    let logStore: LogStore
     let app: AppDelegate
 
     // oMLX-style shell: pinned sidebar (never collapses, no toolbar
@@ -2753,7 +2928,7 @@ struct DashboardView: View {
             switch model.page {
             case .models:   ModelsPage(dm: model, app: app)
             case .upgrade:  EnvPage(app: app, runner: app.upgradeRunner)
-            case .logs:     LogsPage(store: logStore)
+            case .logs:     LogsPage(app: app)
             case .settings: SettingsPage(app: app)
             case .experimental: ExperimentalPage(app: app)
             }
@@ -2788,11 +2963,8 @@ final class DashboardApp: NSObject {
                 backing: .buffered, defer: false)
             w.title = T("Corral 控制面板")
             w.isReleasedWhenClosed = false
-            // the APP's logStore — all appendLogLine calls (menubar events
-            // + router output) land there; this class used to pass its own
-            // empty instance, so the 日志 page showed nothing
             w.contentViewController = NSHostingController(
-                rootView: DashboardView(model: model, logStore: app.logStore, app: app))
+                rootView: DashboardView(model: model, app: app))
             w.setContentSize(NSSize(width: 1080, height: 720))
             w.minSize = NSSize(width: 880, height: 540)
             w.center()

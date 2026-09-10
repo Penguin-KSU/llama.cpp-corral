@@ -261,6 +261,10 @@ let enDict: [String: String] = [
     // ── sidebar / window ──
     "环境": "Environment",
     "日志": "Logs",
+    "暂停滚动": "Pause scroll",
+    "查找历史": "View history",
+    "默认状态": "Reset to default",
+    "实时日志 + 自动滚动": "Live log + auto-scroll",
     "设置": "Settings",
     "Corral 控制面板": "Corral Dashboard",
 
