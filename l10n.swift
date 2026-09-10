@@ -298,6 +298,8 @@ let enDict: [String: String] = [
     "无": "none",
     "读自模型": "read from model",
     "在 PATH 中查找": "looked up in PATH",
+    "跟随 device (none = 不卸载)": "follows device (none = no offload)",
+    "宿主环境 (docker:/podman:/ssh:)": "host environment (docker:/podman:/ssh:)",
     "无 (all = 全部)": "none (all = every tool)",
     "none (逗号分隔: draft-simple, ngram-simple, ...)": "none (comma-separated: draft-simple, ngram-simple, ...)",
     "同 spec-draft-threads": "same as spec-draft-threads",

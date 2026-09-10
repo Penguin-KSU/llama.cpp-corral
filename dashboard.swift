@@ -26,6 +26,10 @@ struct Param {
     let kind: ParamKind
     let def: String      // official default, shown as gray placeholder
     let group: Int       // 1...5, see GROUP_NAMES
+    // llama.cpp one-way flag (no --no-X negation): the preset key being
+    // present enables it no matter the value, so 'off' is not expressible
+    // and the picker only offers default/off... i.e. default + on
+    let oneWay: Bool
 }
 
 let GROUP_NAMES: [Int: String] = [
@@ -36,8 +40,8 @@ let GROUP_NAMES: [Int: String] = [
     5: "其他(多模态 / 服务器 / 投机解码 / 调试)",
 ]
 
-private func P(_ key: String, _ kind: ParamKind, _ def: String, _ group: Int) -> Param {
-    Param(key: key, kind: kind, def: def, group: group)
+private func P(_ key: String, _ kind: ParamKind, _ def: String, _ group: Int, oneWay: Bool = false) -> Param {
+    Param(key: key, kind: kind, def: def, group: group, oneWay: oneWay)
 }
 
 private let KV_TYPES: [String] = ["f16", "f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
@@ -50,7 +54,7 @@ let PARAMS: [Param] = [
     P("ubatch-size", .num, "512", 1),
     P("keep", .num, "0", 1),
     P("n-predict", .num, "-1 (无限)", 1),
-    P("swa-full", .bool, "off", 1),
+    P("swa-full", .bool, "off", 1, oneWay: true),
     P("kv-unified", .text, "auto (slots 为 auto 时启用)", 1),
     P("kv-unified-per-slot", .num, "未设置", 1),
     P("ctx-checkpoints", .num, "32", 1),
@@ -101,14 +105,14 @@ let PARAMS: [Param] = [
     P("lazy-mode", .choice(["on", "auto", "off"]), "auto", 2),
     P("kv-offload", .bool, "on", 2),
     P("repack", .bool, "on", 2),
-    P("no-host", .bool, "off", 2),
+    P("no-host", .bool, "off", 2, oneWay: true),
     P("op-offload", .bool, "on", 2),
     P("numa", .choice(["distribute", "isolate", "numactl"]), "默认", 2),
     P("override-tensor", .text, "", 2),
-    P("cpu-moe", .bool, "off", 2),
+    P("cpu-moe", .bool, "off", 2, oneWay: true),
     P("n-cpu-moe", .num, "默认", 2),
     P("n-cpu-ffn", .num, "默认", 2),
-    P("check-tensors", .bool, "off", 2),
+    P("check-tensors", .bool, "off", 2, oneWay: true),
     P("override-kv", .text, "", 2),
     P("lora", .path, "", 2),
     P("lora-scaled", .text, "格式 FNAME:SCALE", 2),
@@ -143,13 +147,13 @@ let PARAMS: [Param] = [
     P("seed", .num, "-1 (随机)", 3),
     P("samplers", .text, "默认顺序", 3),
     P("sampler-seq", .text, "edskypmxt", 3),
-    P("ignore-eos", .bool, "off", 3),
+    P("ignore-eos", .bool, "off", 3, oneWay: true),
     P("logit-bias", .text, "格式 TOKEN_ID(+/-)BIAS", 3),
     P("grammar", .text, "", 3),
     P("grammar-file", .path, "", 3),
     P("json-schema", .text, "", 3),
     P("json-schema-file", .path, "", 3),
-    P("backend-sampling", .bool, "off", 3),
+    P("backend-sampling", .bool, "off", 3, oneWay: true),
     // ---- group 4: reasoning & template ----
     P("jinja", .bool, "on", 4),
     P("chat-template", .text, "模型自带", 4),
@@ -163,13 +167,13 @@ let PARAMS: [Param] = [
     P("reasoning-preserve", .bool, "on", 4),
     P("skip-chat-parsing", .bool, "off", 4),
     P("prefill-assistant", .bool, "on", 4),
-    P("special", .bool, "off", 4),
+    P("special", .bool, "off", 4, oneWay: true),
     // ---- group 5: misc (multimodal / server / speculative / debug) ----
     P("mmproj", .path, "", 5),
     P("mmproj-url", .text, "", 5),
     P("mmproj-auto", .bool, "on", 5),
     P("mmproj-offload", .bool, "on", 5),
-    P("mmproj-device", .text, "auto", 5),
+    P("mmproj-device", .text, "跟随 device (none = 不卸载)", 5),
     P("image-min-tokens", .num, "读自模型", 5),
     P("image-max-tokens", .num, "读自模型", 5),
     P("mtmd-batch-max-tokens", .num, "1024", 5),
@@ -178,8 +182,8 @@ let PARAMS: [Param] = [
     P("video-ffmpeg-dir", .path, "在 PATH 中查找", 5),
     P("pooling", .choice(["none", "mean", "cls", "last", "rank"]), "模型默认", 5),
     P("embd-normalize", .num, "2", 5),
-    P("embedding", .bool, "off", 5),
-    P("rerank", .bool, "off", 5),
+    P("embedding", .bool, "off", 5, oneWay: true),
+    P("rerank", .bool, "off", 5, oneWay: true),
     P("alias", .text, "", 5),
     P("tags", .text, "", 5),
     P("host", .text, "127.0.0.1", 5),
@@ -195,13 +199,13 @@ let PARAMS: [Param] = [
     P("timeout", .num, "3600", 5),
     P("sse-ping-interval", .num, "30", 5),
     P("threads-http", .num, "-1", 5),
-    P("metrics", .bool, "off", 5),
-    P("props", .bool, "off", 5),
+    P("metrics", .bool, "off", 5, oneWay: true),
+    P("props", .bool, "off", 5, oneWay: true),
     P("slots", .bool, "on", 5),
     P("media-path", .path, "disabled", 5),
     P("ui", .bool, "on (Web UI)", 5),
     P("tools", .text, "无 (all = 全部)", 5),
-    P("tools-runtime", .text, "none", 5),
+    P("tools-runtime", .text, "宿主环境 (docker:/podman:/ssh:)", 5),
     P("mcp-servers-config", .path, "无", 5),
     P("mcp-servers-json", .text, "无", 5),
     P("agent", .bool, "off", 5),
@@ -229,7 +233,7 @@ let PARAMS: [Param] = [
     P("spec-draft-prio-batch", .num, "0", 5),
     P("spec-draft-poll-batch", .num, "同 spec-draft-poll", 5),
     P("spec-draft-override-tensor", .text, "", 5),
-    P("spec-draft-cpu-moe", .bool, "off", 5),
+    P("spec-draft-cpu-moe", .bool, "off", 5, oneWay: true),
     P("spec-draft-n-cpu-moe", .num, "默认", 5),
     P("spec-draft-device", .text, "默认", 5),
     P("spec-draft-ngl", .text, "auto", 5),
@@ -249,16 +253,16 @@ let PARAMS: [Param] = [
     P("spec-ngram-map-k4v-size-m", .num, "48", 5),
     P("spec-ngram-map-k4v-min-hits", .num, "1", 5),
     P("log-verbosity", .num, "3", 5),
-    P("verbose", .bool, "off", 5),
+    P("verbose", .bool, "off", 5, oneWay: true),
     P("log-colors", .choice(["on", "off", "auto"]), "auto", 5),
     P("log-prefix", .bool, "on", 5),
     P("log-timestamps", .bool, "on", 5),
     P("log-file", .path, "", 5),
-    P("offline", .bool, "off", 5),
+    P("offline", .bool, "off", 5, oneWay: true),
     P("perf", .bool, "off", 5),
     P("escape", .bool, "on", 5),
     P("reverse-prompt", .text, "", 5),
-    P("spm-infill", .bool, "off", 5),
+    P("spm-infill", .bool, "off", 5, oneWay: true),
 ]
 
 let PARAM_INDEX: [String: Param] = Dictionary(uniqueKeysWithValues: PARAMS.map { ($0.key, $0) })
@@ -518,13 +522,18 @@ struct DenseRow: View {
             set: { nv in fm.setValue(self.param.key, nv) })
     }
 
-    // bools render as a 3-state picker: default (unset, not written to the
-    // .llm file, llama.cpp default applies) / on / off. Legacy "1"/"0" values
+    // bools render as a picker: default (unset, not written to the .llm
+    // file, llama.cpp default applies) / on / off. Legacy "1"/"0" values
     // written by the old toggle map onto on/off for display.
+    // One-way flags (no --no-X in llama.cpp) only offer default + on:
+    // the preset key being present enables them regardless of value, so
+    // 'off' is not expressible. Any stored value (even legacy "0", which
+    // is actually ON at runtime) displays as on.
     private var boolValueBinding: Binding<String> {
         Binding(
             get: {
                 let v = (fm.values[self.param.key] ?? "").lowercased()
+                if param.oneWay { return v.isEmpty ? "" : "on" }
                 if v == "1" || v == "on" || v == "true" { return "on" }
                 if v == "0" || v == "off" || v == "false" { return "off" }
                 return ""
@@ -605,9 +614,14 @@ struct DenseRow: View {
         switch param.kind {
         case .bool:
             Picker("", selection: boolValueBinding) {
-                Text("default").tag("")
-                Text("on").tag("on")
-                Text("off").tag("off")
+                if param.oneWay {
+                    Text("default (off)").tag("")
+                    Text("on").tag("on")
+                } else {
+                    Text("default").tag("")
+                    Text("on").tag("on")
+                    Text("off").tag("off")
+                }
             }
             .labelsHidden()
             .controlSize(.small)
