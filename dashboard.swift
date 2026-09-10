@@ -518,13 +518,18 @@ struct DenseRow: View {
             set: { nv in fm.setValue(self.param.key, nv) })
     }
 
-    private var boolBinding: Binding<Bool> {
+    // bools render as a 3-state picker: default (unset, not written to the
+    // .llm file, llama.cpp default applies) / on / off. Legacy "1"/"0" values
+    // written by the old toggle map onto on/off for display.
+    private var boolValueBinding: Binding<String> {
         Binding(
             get: {
                 let v = (fm.values[self.param.key] ?? "").lowercased()
-                return v == "1" || v == "on" || v == "true"
+                if v == "1" || v == "on" || v == "true" { return "on" }
+                if v == "0" || v == "off" || v == "false" { return "off" }
+                return ""
             },
-            set: { on in fm.setValue(self.param.key, on ? "1" : "0") })
+            set: { nv in fm.setValue(self.param.key, nv) })
     }
 
     // key column is fixed so every row aligns (175 fits the longest keys,
@@ -593,15 +598,21 @@ struct DenseRow: View {
     }
 
     // every branch is sized by the caller (flexible, min controlMinWidth),
-    // so text fields, dropdowns, toggles and path rows all start at the
+    // so text fields, dropdowns and path rows all start at the
     // same x and their text is left-aligned inside the column
     @ViewBuilder
     private var control: some View {
         switch param.kind {
         case .bool:
-            Toggle("", isOn: boolBinding)
-                .labelsHidden()
-                .controlSize(.small)
+            Picker("", selection: boolValueBinding) {
+                Text("default").tag("")
+                Text("on").tag("on")
+                Text("off").tag("off")
+            }
+            .labelsHidden()
+            .controlSize(.small)
+            // version-C look: a chosen value stands out in bold accent
+            .foregroundStyle(isSet ? Color.accentColor : Color.primary)
         case .choice(let choices):
             Picker("", selection: valueBinding) {
                 Text("default (\(T(param.def)))").tag("")
