@@ -14,7 +14,7 @@ cp icons/status_idle.png icons/status_loaded.png "$APP/Contents/Resources/"
 
 swiftc -O -o "$APP/Contents/MacOS/corral" main.swift icon.swift dashboard.swift l10n.swift proxy.swift \
     -target "$(uname -m)-apple-macos14.0" \
-    -framework AppKit -framework ServiceManagement -framework SwiftUI -framework Network
+    -framework AppKit -framework ServiceManagement -framework SwiftUI
 
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

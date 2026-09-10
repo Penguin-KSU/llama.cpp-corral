@@ -337,6 +337,13 @@ struct LlmFile {
 final class LogStore: ObservableObject {
     @Published private(set) var lines: [String] = []
     func append(_ line: String) {
+        // @Published must mutate on the main thread; the audio proxy calls
+        // in from its own queues (audit B11). Hop once; the cap logic and
+        // ordering land on the main queue (FIFO), same as router lines.
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { self.append(line) }
+            return
+        }
         lines.append(line)
         // cap in-memory buffer (~200k chars, mirrors the old window)
         if lines.count > 4000 { lines.removeFirst(lines.count - 4000) }
@@ -673,7 +680,8 @@ struct FormView: View {
             sectionHeader(title: T("基本 · 置顶"), count: pinnedRows.count, setCount: pinnedSetCount,
                           chevron: false, isOpen: true)
             if fm.mode == .add || fm.mode.isEdit {
-                fixedFieldRow("model", value: $fm.ggufPath, placeholder: T("GGUF 文件路径(必填)"), browse: true)
+                fixedFieldRow("model", value: $fm.ggufPath, placeholder: T("GGUF 文件路径(必填)"), browse: true,
+                              readOnly: fm.mode.isEdit)
                 // 显示别名: 只影响 UI 显示, 模型 ID 恒为 GGUF 真名
                 fixedFieldRow(T("自定义名称"), value: $fm.customName, placeholder: T("留空 = 显示文件名"), browse: false)
                 if fm.mode == .add, !fm.targetID.isEmpty {
@@ -700,7 +708,9 @@ struct FormView: View {
 
     @ViewBuilder
     private func sectionCard(_ g: Int) -> some View {
+        // 组内参数按字母序(用户定案 2026-09-10:原定义顺序观感乱)
         let rows = PARAMS.filter { $0.group == g && !fm.pinned.contains($0.key) && matches($0) }
+            .sorted { $0.key < $1.key }
         if !rows.isEmpty {
             VStack(spacing: 0) {
                 Button {
@@ -727,7 +737,9 @@ struct FormView: View {
         }
     }
 
-    private var pinnedRows: [Param] { PARAMS.filter { fm.pinned.contains($0.key) && matches($0) } }
+    // 基本区钉上来的参数也按字母序(与分组 section 一致)
+    private var pinnedRows: [Param] { PARAMS.filter { fm.pinned.contains($0.key) && matches($0) }
+        .sorted { $0.key < $1.key } }
     private var pinnedSetCount: Int { pinnedRows.filter { !(fm.values[$0.key] ?? "").isEmpty }.count }
 
     // 卡片突破页面 50pt padding 填到窗口边缘(内容仍留 50):
@@ -760,7 +772,7 @@ struct FormView: View {
         .overlay(Divider(), alignment: .bottom)
     }
 
-    private func fixedFieldRow(_ label: String, value: Binding<String>, placeholder: String, browse: Bool) -> some View {
+    private func fixedFieldRow(_ label: String, value: Binding<String>, placeholder: String, browse: Bool, readOnly: Bool = false) -> some View {
         HStack(spacing: 8) {
             Text(label)
                 .font(.system(size: 11, design: .monospaced))
@@ -768,7 +780,8 @@ struct FormView: View {
                 .frame(width: DenseRow.keyWidth, alignment: .leading)
             TextField(placeholder, text: value)
                 .font(.system(size: 11, design: .monospaced))
-            if browse {
+                .disabled(readOnly)   // 灰色只读(编辑模式:路径 = 模型身份,不可改)
+            if browse && !readOnly {
                 Button(T("浏览…")) {
                     let panel = NSOpenPanel()
                     panel.canChooseFiles = true
@@ -1021,6 +1034,137 @@ struct ModelsPage: View {
 
 // MARK: - Upgrade page (git pull + cmake build of the user's llama.cpp)
 
+// Runs a shell command in its OWN process group so the whole tree
+// (zsh + git/cmake/ninja/compilers) can be killed as a unit (audit A4).
+// fork+exec, not Process: on macOS the parent cannot regroup a
+// posix_spawned child (setpgid after Process.run() → EPERM, verified),
+// so a group-killable command has to be forked. Parent-side
+// setpgid(child, child) is the pattern proven in RouterProc (audit A2).
+final class GroupRunner {
+    private(set) var pid: pid_t = 0
+    private(set) var pgid: pid_t = 0
+    private var readHandle: FileHandle?
+    private var pending = Data()
+    // set by whichever reaps first (EOF handler or killTree()); exit code,
+    // -1 if the process died by signal or was never reaped
+    private var exitStatus: Int32? = nil
+    // both callbacks are delivered on the main queue
+    var onLine: ((String) -> Void)?
+    var onExit: ((Int32) -> Void)?
+
+    private static func codeOf(_ status: Int32) -> Int32 {
+        (status & 0x7f) == 0 ? (status >> 8) & 0xff : -1
+    }
+
+    // returns error message, or nil on success
+    func start(command: String) -> String? {
+        var fds: [Int32] = [-1, -1]
+        guard pipe(&fds) == 0 else { return "pipe() failed" }
+        let writeFd = fds[1]
+        let cZsh = strdup("/bin/zsh"), cLc = strdup("-lc"), cCmd = strdup(command)
+        var argv: [UnsafeMutablePointer<CChar>?] = [cZsh, cLc, cCmd, nil]
+        let child = sys_fork()
+        if child < 0 {
+            close(fds[0]); close(writeFd)
+            free(cZsh); free(cLc); free(cCmd)
+            return "fork() failed"
+        }
+        if child == 0 {
+            // child: stdout/stderr -> pipe, then exec. Only
+            // async-signal-safe C calls from here on (RouterProc discipline).
+            // dup2 returns the NEW fd on success (1 / 2), -1 on error —
+            // checking != 0 would always "fail" and kill the child (caught
+            // by /tmp replica: 8/8 runs died at the first dup2)
+            if dup2(writeFd, 1) == -1 { _exit(127) }
+            if dup2(writeFd, 2) == -1 { _exit(127) }
+            if writeFd > 2 { close(writeFd) }
+            execv(cZsh, &argv)
+            _exit(127)
+        }
+        close(writeFd)
+        free(cZsh); free(cLc); free(cCmd)   // child has its own address space
+        pid = child
+        pgid = (setpgid(child, child) == 0) ? child : 0
+        let h = FileHandle(fileDescriptor: fds[0], closeOnDealloc: false)
+        readHandle = h
+        h.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard let self else { return }
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                // EOF: every writer (zsh + all children) is gone, so the
+                // wait returns immediately. Reap, flush a trailing line
+                // without newline (audit D1), close the fd exactly once.
+                var status: Int32 = 0
+                if self.pid > 0, waitpid(self.pid, &status, 0) == self.pid {
+                    self.pid = 0
+                    self.exitStatus = Self.codeOf(status)
+                }
+                if !self.pending.isEmpty {
+                    let rest = String(data: self.pending, encoding: .utf8) ?? ""
+                    self.pending = Data()
+                    DispatchQueue.main.async { self.onLine?(rest) }
+                }
+                handle.closeFile()
+                self.readHandle = nil
+                self.pgid = 0
+                let code = self.exitStatus ?? -1
+                DispatchQueue.main.async { self.onExit?(code) }
+                return
+            }
+            self.pending.append(data)
+            while let idx = self.pending.firstIndex(of: 0x0A) {
+                let line = String(data: self.pending.subdata(in: 0..<idx), encoding: .utf8)
+                self.pending.removeSubrange(0..<idx + 1)
+                if let line { DispatchQueue.main.async { self.onLine?(line) } }
+            }
+        }
+        return nil
+    }
+
+    // SIGTERM the whole group, wait up to 5s, escalate to SIGKILL.
+    // Safe to call when the tree is already gone (no-op).
+    func killTree() {
+        let g = pgid
+        guard pid > 0 || g > 0 else { return }
+        let useGroup = g > 0 && g != getpgid(0)
+        if useGroup { kill(-g, SIGTERM) } else if pid > 0 { kill(pid, SIGTERM) }
+        let start = Date()
+        while Date().timeIntervalSince(start) < 5 {
+            if pid > 0 {
+                var status: Int32 = 0
+                if waitpid(pid, &status, WNOHANG) == pid {
+                    pid = 0
+                    exitStatus = Self.codeOf(status)
+                }
+            }
+            let gone = useGroup ? kill(-g, 0) != 0 : (pid == 0 || kill(pid, 0) != 0)
+            if gone { break }
+            usleep(100_000)
+        }
+        if useGroup, kill(-g, 0) == 0 {
+            kill(-g, SIGKILL)
+            if pid > 0 { waitpid(pid, nil, 0); pid = 0; exitStatus = -1 }
+        } else if !useGroup, pid > 0, kill(pid, 0) == 0 {
+            kill(pid, SIGKILL)
+            waitpid(pid, nil, 0)
+            pid = 0
+            exitStatus = -1
+        }
+    }
+}
+
+// Shared across all UpgradeRunner instances: only one build pipeline may run
+// at a time. The env-page (llama.cpp 升级) and settings-page (Corral 自更新)
+// runners are separate instances with separate `running` flags; without this
+// a user could trigger both and they'd race on teardown (both end by stopping
+// the router / relaunching the app). Pages observe this to disable their
+// update buttons while any pipeline is busy (audit D11).
+final class PipelineState: ObservableObject {
+    static let shared = PipelineState()
+    @Published var busy = false
+}
+
 final class UpgradeRunner: ObservableObject {
     @Published var lines: [String] = []
     @Published var running = false
@@ -1028,40 +1172,25 @@ final class UpgradeRunner: ObservableObject {
     // success/failure drives the finished-line color — never key off the
     // display text (it changes with the UI language)
     @Published var finishedOK = true
-    private var proc: Process?
+    private var runner: GroupRunner?
+    // set by cancel(): the finished line then says 已取消 instead of 失败
+    private var cancelled = false
 
-    // runs a command via a login shell so PATH (homebrew cmake) resolves
+    // runs a command via a login shell (PATH: homebrew cmake) in its own
+    // process group, so cancel() can kill the whole tree
     private func run(_ command: String, done: @escaping (Bool) -> Void) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", command]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = pipe
-        proc = p
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
-            let d = h.availableData
-            guard !d.isEmpty, let self else { return }
-            let s = String(data: d, encoding: .utf8) ?? ""
-            DispatchQueue.main.async {
-                for line in s.split(separator: "\n", omittingEmptySubsequences: false) {
-                    self.lines.append(String(line))
-                }
-            }
+        let r = GroupRunner()
+        runner = r
+        cancelled = false
+        r.onLine = { [weak self] line in self?.lines.append(line) }
+        r.onExit = { [weak self] code in
+            self?.runner = nil
+            done(code == 0)
         }
-        p.terminationHandler = { [weak self] _ in
-            pipe.fileHandleForReading.readabilityHandler = nil
-            let ok = p.terminationStatus == 0
-            DispatchQueue.main.async {
-                self?.proc = nil
-                done(ok)
-            }
-        }
-        do {
-            try p.run()
-        } catch {
-            proc = nil
-            DispatchQueue.main.async { done(false) }
+        if let err = r.start(command: command) {
+            runner = nil
+            lines.append(err)
+            done(false)
         }
     }
 
@@ -1079,29 +1208,43 @@ final class UpgradeRunner: ObservableObject {
 
     // upgrade an existing self-built checkout (git pull + rebuild);
     // on success the router is restarted so the new binary takes effect.
+    // pull=false (编译并生效) compiles exactly what's in the tree — pulling
+    // is 开始升级's job; hasUpstream=false skips the pull step with a note
+    // instead of dying on "no tracking information" (audit A7). Real pull
+    // failures (conflict/network) still fail the pipeline either way.
     // doneMessage: the caller still has post-steps (record built, restart
     // router) after done(ok), so the "finished" line must not claim the
     // whole job is over — the caller supplies the accurate wording
-    func start(src: String, doneMessage: String? = nil, done: @escaping (Bool) -> Void) {
-        guard !running else { return }
+    func start(src: String, pull: Bool = true, hasUpstream: Bool = true,
+               doneMessage: String? = nil, done: @escaping (Bool) -> Void) {
+        guard !running, !PipelineState.shared.busy else { return }
         running = true
+        PipelineState.shared.busy = true
         finished = nil
         lines = []
-        pipeline([
-            ("$ git -C \(src) pull", "git -C \"\(src)\" pull"),
-            ("$ cmake --build \(src)/build -j 8", "cmake --build \"\(src)/build\" -j 8"),
-        ]) { ok in
+        var steps: [(String, String)] = []
+        if pull {
+            if hasUpstream {
+                steps.append(("$ git -C \(src) pull", "git -C \"\(src)\" pull"))
+            } else {
+                note(T("当前分支无上游,跳过 pull 直接编译"))
+            }
+        }
+        steps.append(("$ cmake --build \(src)/build -j 8", "cmake --build \"\(src)/build\" -j 8"))
+        pipeline(steps) { ok in
             self.running = false
+            PipelineState.shared.busy = false
             self.finishedOK = ok
-            self.finished = ok ? (doneMessage ?? T("升级完成")) : T("升级失败,查看上方输出")
+            self.finished = ok ? (doneMessage ?? T("升级完成")) : (self.cancelled ? T("已取消") : T("升级失败,查看上方输出"))
             done(ok)
         }
     }
 
     // Corral 自身一键更新: 自己源码仓库里 pull + 重编
     func selfUpdate(repo: String, done: @escaping (Bool) -> Void) {
-        guard !running else { return }
+        guard !running, !PipelineState.shared.busy else { return }
         running = true
+        PipelineState.shared.busy = true
         finished = nil
         lines = []
         pipeline([
@@ -1109,8 +1252,9 @@ final class UpgradeRunner: ObservableObject {
             ("$ ./build.sh", "cd \"\(repo)\" && ./build.sh"),
         ]) { ok in
             self.running = false
+            PipelineState.shared.busy = false
             self.finishedOK = ok
-            self.finished = ok ? T("更新完成") : T("更新失败,查看上方输出")
+            self.finished = ok ? T("更新完成") : (self.cancelled ? T("已取消") : T("更新失败,查看上方输出"))
             done(ok)
         }
     }
@@ -1126,7 +1270,7 @@ final class UpgradeRunner: ObservableObject {
                    "curl -LsSf https://llama.app/install.sh | sh")]) { ok in
             self.running = false
             self.finishedOK = ok
-            self.finished = ok ? T("官方版安装完成") : T("官方版安装失败,查看上方输出")
+            self.finished = ok ? T("官方版安装完成") : (self.cancelled ? T("已取消") : T("官方版安装失败,查看上方输出"))
             done(ok)
         }
     }
@@ -1155,13 +1299,19 @@ final class UpgradeRunner: ObservableObject {
         pipeline(steps) { ok in
             self.running = false
             self.finishedOK = ok
-            self.finished = ok ? T("源码版安装完成") : T("源码版安装失败,查看上方输出")
+            self.finished = ok ? T("源码版安装完成") : (self.cancelled ? T("已取消") : T("源码版安装失败,查看上方输出"))
             done(ok)
         }
     }
 
+    // kill the WHOLE command tree (zsh + git/cmake/ninja/compilers), not
+    // just the shell — a SIGTERM to the shell alone left the build running
+    // in the background while the UI said "stopped" (audit A4)
     func cancel() {
-        proc?.terminate()
+        guard let r = runner else { return }
+        cancelled = true
+        // killTree() blocks up to 5s (SIGKILL escalation) — off the main thread
+        DispatchQueue.global().async { r.killTree() }
     }
 
     // plain status line (branch switch results etc.)
@@ -1191,8 +1341,18 @@ final class EnvPageModel: ObservableObject {
     @Published var adoptName = ""
     @Published var updateLine = ""     // 更新检查状态行
     @Published var hasUpdate = false
-    @Published var pendingRebuildBranch: String?   // 切了分支但还没编译
+    // 状态派生(非动作派生): built != head 就亮, 终端 checkout 也能感知
+    // (审计 B13)。built 为空(app 内没编过/外部接入)不亮 —— "二进制旧"
+    // 要有正向知识, 未知情况由 branchNotes 事件消息覆盖。
+    @Published var needsRebuild = false
     @Published var currentBehindUpstream: Int?     // 当前分支落后自己上游几个提交
+    // 更新检查的 git fetch 与升级流水线的 git pull 都更新同一仓库的
+    // refs/remotes/*,并发会撞 ref 锁(真机见过:打开页面时的检查 fetch
+    // 撞上升级 pull → "cannot lock ref ... unable to update local ref")。
+    // 用 checkInFlight 串行化:检查在飞时 startUpgrade 挂起(pendingUpgrade),
+    // 检查完成立刻补跑;流水线在跑时检查直接跳过(下次打开页面再查)。
+    private var checkInFlight = false
+    private var pendingUpgrade: (() -> Void)?
     // 每个 tab 自己的信息区(不共用升级的流水线日志)
     @Published var branchNotes: [String] = []
     @Published var adoptNotes: [String] = []
@@ -1205,14 +1365,15 @@ final class EnvPageModel: ObservableObject {
         env = app.detectEnv()
         version = ""
         missingTools = []
-        branches = []
-        branchSearch = ""
         updateLine = ""
         hasUpdate = false
-        pendingRebuildBranch = nil
+        needsRebuild = false
         currentBehindUpstream = nil
-        branchNotes = []
-        adoptNotes = []
+        // 只重置"打开即查"的自动查询; 用户输入(tab/adoptDirPath/adoptName/
+        // branchSearch)、事件记录(branchNotes/adoptNotes, append-only, 只随
+        // app 重置, 2026-09-10 定案)、流水线便签(pipelineOrigin)和分支列表
+        // (手动查询结果, 按钮保持「刷新」, 用户点刷新才重新 fetch, 2026-09
+        // 验证时定案)都不动 —— model 由 app 主体保管, 切页天然存活
         queryVersion()
         if env == .source {
             queryBranch()
@@ -1222,17 +1383,24 @@ final class EnvPageModel: ObservableObject {
 
     // 源码版: fetch(只动远程标记) + 数当前分支落后上游几个提交
     func checkSourceUpdate() {
+        guard !checkInFlight else { return }
+        guard !app.upgradeRunner.running else { return }
+        checkInFlight = true
         updateLine = T("检查更新中…")
         let src = app.settings.src
         DispatchQueue.global().async {
             guard self.app.gitFetch(src) else {
-                DispatchQueue.main.async { self.updateLine = T("检查更新失败(网络?),下次打开页面再试") }
+                DispatchQueue.main.async {
+                    self.finishCheck()
+                    self.updateLine = T("检查更新失败(网络?),下次打开页面再试")
+                }
                 return
             }
             let info = self.app.gitBehindInfo(src)
             let built = self.app.settings.built
             let head = self.app.gitHead(src)
             DispatchQueue.main.async {
+                self.finishCheck()
                 if info == nil {
                     self.updateLine = T("当前分支无对应远程分支,跳过检查")
                 } else {
@@ -1298,8 +1466,12 @@ final class EnvPageModel: ObservableObject {
             // unborn HEAD name ("master") — hide the branch until there
             // are actual commits
             let b = self.app.gitCurrentBranch(src)
-            let hasCommits = !self.app.gitHead(src).isEmpty
-            DispatchQueue.main.async { self.currentBranch = hasCommits ? b : "" }
+            let head = self.app.gitHead(src)
+            let hasCommits = !head.isEmpty
+            DispatchQueue.main.async {
+                self.currentBranch = hasCommits ? b : ""
+                self.needsRebuild = !self.app.settings.built.isEmpty && self.app.settings.built != head
+            }
         }
     }
 
@@ -1313,9 +1485,15 @@ final class EnvPageModel: ObservableObject {
             for b in list where b != self.app.gitCurrentBranch(src) {
                 if let ab = self.app.gitAheadBehind(src, b) { diff[b] = ab }
             }
+            let cur = self.app.gitCurrentBranch(src)
+            let head = self.app.gitHead(src)
             DispatchQueue.main.async {
                 self.branches = list
                 self.branchDiff = diff
+                // 刷新按钮也要重算横幅/当前分支: 终端 checkout 后点刷新
+                // 应该能亮/灭横幅(审计 B13)
+                self.currentBranch = cur
+                self.needsRebuild = !self.app.settings.built.isEmpty && self.app.settings.built != head
             }
         }
     }
@@ -1345,6 +1523,20 @@ final class EnvPageModel: ObservableObject {
             a.runModal()
             return
         }
+        // checkout -B resets a same-named local branch to the remote,
+        // discarding its unpushed commits — block instead of doing that
+        // silently (same terminal-policy as the dirty check above)
+        if name.contains("/") {
+            let local = (name as NSString).lastPathComponent
+            if let ahead = app.gitRevCount(src, name + ".." + local), ahead > 0 {
+                let a = NSAlert()
+                a.messageText = TF("本地分支 %@ 有 %d 个未推送提交", local, ahead)
+                a.informativeText = T("切换到远程分支会把本地分支重置到远程状态,这些提交将被丢弃。请先在终端 push 或处理后再切换。")
+                a.addButton(withTitle: T("知道了"))
+                a.runModal()
+                return
+            }
+        }
 
         DispatchQueue.global().async {
             let err = self.app.gitCheckout(src, name)
@@ -1358,10 +1550,10 @@ final class EnvPageModel: ObservableObject {
                     // (built 未知时保守提示, app 内编过一次后即精确)
                     let head = self.app.gitHead(src)
                     if !self.app.settings.built.isEmpty, self.app.settings.built == head {
-                        self.pendingRebuildBranch = nil
+                        self.needsRebuild = false
                         self.branchNotes.append(TF("已切换到 %@(与当前编译版本一致,无需重新编译)", local))
                     } else {
-                        self.pendingRebuildBranch = local
+                        self.needsRebuild = !self.app.settings.built.isEmpty
                         self.branchNotes.append(TF("已切换到 %@ —— 需要重新编译,点「编译并生效」", local))
                     }
                 }
@@ -1423,18 +1615,37 @@ final class EnvPageModel: ObservableObject {
         }
     }
 
+    // 检查完(成功或失败)都走这里:放行挂起的升级启动
+    private func finishCheck() {
+        checkInFlight = false
+        let p = pendingUpgrade
+        pendingUpgrade = nil
+        p?()
+    }
+
     func startUpgrade(from tab: EnvTab) {
+        // 页面打开时的更新检查可能还在 fetch —— 等它完成再启动,
+        // 否则我们的 git pull 会和它撞 ref 锁(真机见过)
+        if checkInFlight {
+            pendingUpgrade = { [weak self] in self?.startUpgrade(from: tab) }
+            return
+        }
         pipelineOrigin = tab
         let src = app.settings.src
+        // 开始升级 = pull + 编;编译并生效 = 只编当前树(无上游分支上
+        // pull 必败,且语义上就不该 pull —— audit A7)
         app.upgradeRunner.start(src: src,
+                                pull: tab == .upgrade,
+                                hasUpstream: app.gitHasUpstream(src),
                                 doneMessage: T("编译完成,正在重启 router 生效…")) { [weak self] ok in
             guard let self else { return }
             if ok {
                 self.app.recordBuiltCommit()
                 self.app.settings.save()   // recordBuiltCommit only sets memory — persist it
-                self.pendingRebuildBranch = nil
+                self.needsRebuild = false   // built == head 刚成立
                 // the running router still has the old binary
                 self.app.restartRouterNow()
+                self.app.upgradeWaitInFlight = true   // 挂起健康恢复, 120s 等待自己掌舵(审计 B8)
                 self.queryVersion()
                 self.waitRouterHealthy(attempt: 0)
             }
@@ -1447,6 +1658,9 @@ final class EnvPageModel: ObservableObject {
         guard attempt < 40 else {
             app.upgradeRunner.finishedOK = false
             app.upgradeRunner.finished = T("router 仍未就绪,请查看日志页")
+            // 标志清零 = 健康路径接管: router 还活着但不健康 → ~6s 后
+            // (2 次轮询)正常杀掉; 碰巧此刻健康 → 不杀。挂起不瘫痪(审计 B8)
+            app.upgradeWaitInFlight = false
             return
         }
         DispatchQueue.global().async { [weak self] in
@@ -1456,6 +1670,7 @@ final class EnvPageModel: ObservableObject {
                 if ok {
                     self.app.upgradeRunner.finishedOK = true
                     self.app.upgradeRunner.finished = T("✅ 升级完成,router 已生效")
+                    self.app.upgradeWaitInFlight = false
                 } else {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                         self.waitRouterHealthy(attempt: attempt + 1)
@@ -1551,7 +1766,7 @@ final class EnvPageModel: ObservableObject {
         if let err = app.adoptSourceDir(dir, name: adoptName.trimmingCharacters(in: .whitespaces)) {
             adoptNotes.append(TF("接入失败:\n%@", err))
         } else {
-            refresh()   // 先 refresh: 它会清空 adoptNotes, 提示必须写在后面
+            refresh()   // 刷新环境/已录用列表; adoptNotes 是 append-only, 顺序无约束
             adoptNotes.append(TF("已接入 %@,router 已重启", dir))
             adoptDirPath = ""
             adoptName = ""
@@ -1591,12 +1806,13 @@ struct EnvPage: View {
     let app: AppDelegate
     @ObservedObject var runner: UpgradeRunner
     @ObservedObject var l10n = L10n.shared   // re-render on language switch
-    @StateObject private var m: EnvPageModel
+    @ObservedObject var pipelineState = PipelineState.shared   // 跨页互斥: 任一流水线在跑就禁用本页更新按钮
+    @ObservedObject var m: EnvPageModel   // app 主体保管(app.envModel), 切页不销毁
 
     init(app: AppDelegate, runner: UpgradeRunner) {
         self.app = app
         self.runner = runner
-        _m = StateObject(wrappedValue: EnvPageModel(app: app))
+        _m = ObservedObject(wrappedValue: app.envModel)
     }
 
     var body: some View {
@@ -1625,6 +1841,9 @@ struct EnvPage: View {
                 Divider()
                 tabContent
             } else {
+                // 官方/未安装页头(方案 B 重构时 source 页头内联了,这两页的
+                // 页头被孤儿化 —— 审计 C1 恢复)
+                stateHeader
                 if m.env == .official {
                     HStack {
                         updateLineView
@@ -1643,8 +1862,10 @@ struct EnvPage: View {
                     }
                     Spacer()
                 }
-                // 官方版页面: 有已录入的编译版时给出列表, 保证能切回去
-                if m.env == .official, m.adoptRows().contains(where: { !$0.official }) {
+                // 官方/未安装页面: 有已录入的编译版时给出列表, 保证能切回去
+                // (.none 也要: 当前 bin 坏了但 sources 里有健康目录时, 这是
+                // 唯一的 UI 切回入口 —— 审计 B10)
+                if m.env == .official || m.env == .none, m.adoptRows().contains(where: { !$0.official }) {
                     Divider()
                     Text(T("可用编译版(点击切换)"))
                         .font(.callout)
@@ -1781,7 +2002,7 @@ struct EnvPage: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     Button(app.srcIsManaged ? T("开始升级") : TF("升级 %@", m.currentDisplayName)) { m.startUpgrade(from: .upgrade) }
-                        .disabled(runner.running)
+                        .disabled(runner.running || pipelineState.busy)
                     Spacer()
                     updateLineView
                 }
@@ -1881,7 +2102,9 @@ struct EnvPage: View {
                                     .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                .disabled(isCurrent)
+                                // 构建运行中禁切分支: checkout 和后台构建对撞
+                                // 会改到正被编译的源码树 (接入按钮已有同款 disabled)
+                                .disabled(isCurrent || runner.running)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
                                 .help(isCurrent
@@ -1897,13 +2120,13 @@ struct EnvPage: View {
                     .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
                 }
                 // 切换后需要编译: 就地给编译入口, 不用跑去「升级」页
-                if let pending = m.pendingRebuildBranch {
+                if m.needsRebuild && !m.currentBranch.isEmpty {
                     HStack(spacing: 10) {
-                        Text(TF("已切换到 %@,需要重新编译才生效", pending))
+                        Text(TF("当前分支 %@ 未编译,需要重新编译才生效", m.currentBranch))
                             .font(.callout)
                             .foregroundStyle(.orange)
                         Button(T("编译并生效")) { m.startUpgrade(from: .branches) }
-                            .disabled(runner.running)
+                            .disabled(runner.running || pipelineState.busy)
                         Spacer()
                     }
                     .padding(10)
@@ -1974,6 +2197,10 @@ struct EnvPage: View {
             .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
             .onChange(of: lines.count) {
                 proxy.scrollTo("tail", anchor: .bottom)
+            }
+            .onAppear {
+                // 页面重建后首次显示停在末尾(不是第一行); async 等布局完成
+                DispatchQueue.main.async { proxy.scrollTo("tail", anchor: .bottom) }
             }
         }
     }
@@ -2102,11 +2329,27 @@ final class SettingsFormModel: ObservableObject {
     @Published var updateLine = ""
     @Published var updateCount = 0    // >0 = 有更新
     let app: AppDelegate
+    // 端口输入合法性: 空(= 默认)或 1-65535 的数字; 其余(非数字/0/负数/
+    // >65535)非法 —— 非法时确认按钮置灰, 0/99999 这类合法 Int 不能再
+    // 存进去把 router 搞到 crash-loop(审计 B5)
+    var portValid: Bool {
+        let p = port.trimmingCharacters(in: .whitespaces)
+        if p.isEmpty { return true }
+        guard let n = Int(p) else { return false }
+        return (1...65535).contains(n)
+    }
     init(app: AppDelegate) {
         self.app = app
         host = app.settings.host
         port = app.settings.port.map(String.init) ?? ""
         pinned = Set(app.settings.pinnedEndpoints)
+    }
+
+    // 有显式保存按钮的输入, 没保存切页就该回退(2026-09 验证时定案);
+    // endpointsOpen 无保存概念, 是视图状态, 保留
+    func resetConnectionDraft() {
+        host = app.settings.host
+        port = app.settings.port.map(String.init) ?? ""
     }
 
     // 打开页面即查(与环境页同模式): 自己源码仓库 fetch + 数落后上游几个提交
@@ -2165,12 +2408,14 @@ final class SettingsFormModel: ObservableObject {
 struct SettingsPage: View {
     let app: AppDelegate
     @ObservedObject var l10n = L10n.shared   // re-render on language switch
-    @StateObject private var m: SettingsFormModel
-    @StateObject private var ur = UpgradeRunner()   // 本页专用, 与环境页的 runner 互不干扰
+    @ObservedObject var pipelineState = PipelineState.shared   // 跨页互斥: 任一流水线在跑就禁用本页更新按钮
+    @ObservedObject var m: SettingsFormModel   // app 主体保管(app.settingsModel), 切页不销毁
+    @ObservedObject var ur: UpgradeRunner      // app 主体保管, 本页专用, 与环境页的 runner 互不干扰
 
     init(app: AppDelegate) {
         self.app = app
-        _m = StateObject(wrappedValue: SettingsFormModel(app: app))
+        _m = ObservedObject(wrappedValue: app.settingsModel)
+        _ur = ObservedObject(wrappedValue: app.selfUpdateRunner)
     }
 
     // 留空 = llama.cpp 默认; 输入实时驱动 API 地址预览(点确认才真正生效)
@@ -2210,27 +2455,35 @@ struct SettingsPage: View {
                 Toggle(T("开机启动"), isOn: Binding(
                     get: { SMAppService.mainApp.status == .enabled },
                     set: { _ in app.toggleLogin() }))
-                HStack {
-                    Text(T("主机")).frame(width: 120, alignment: .leading)
+                // 主机/端口同行:确认按钮同时保存两者,分行会误以为只确认端口
+                HStack(spacing: 8) {
+                    Text(T("主机"))
                     TextField(T("127.0.0.1(留空 = 默认)"), text: $m.host)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(m.host.isEmpty ? Color.secondary : .primary)
+                        .frame(width: 160)
                         .onChange(of: m.host) { m.saved = false }
-                }
-                HStack {
-                    Text(T("端口")).frame(width: 120, alignment: .leading)
+                    Text(T("端口"))
                     TextField(T("8080(留空 = 默认)"), text: $m.port)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(m.port.isEmpty ? Color.secondary : .primary)
                         .frame(width: 100)
                         .onChange(of: m.port) { m.saved = false }
                     Button(T("确认")) {
-                        app.saveConnection(host: m.host, port: Int(m.port))   // empty/invalid = default 8080
+                        // 结束编辑态:光标消失,不用先点空白处
+                        NSApp.keyWindow?.makeFirstResponder(nil)
+                        app.saveConnection(host: m.host, port: Int(m.port.trimmingCharacters(in: .whitespaces)))
                         m.saved = true
                     }
+                    .disabled(!m.portValid)
                     if m.saved {
                         Text(T("已保存")).font(.caption).foregroundStyle(.secondary)
                     }
+                }
+                if !m.portValid {
+                    Text(T("端口需为 1-65535 的数字"))
+                        .font(.caption).foregroundStyle(.red)
+                        .padding(.leading, 4)
                 }
             }
 
@@ -2310,7 +2563,7 @@ struct SettingsPage: View {
                     }
                     Spacer()
                     Button(T("更新")) { m.startSelfUpdate(runner: ur) }
-                        .disabled(ur.running || m.updateCount == 0)
+                        .disabled(ur.running || pipelineState.busy || m.updateCount == 0)
                 }
                 if ur.running {
                     Button(T("取消")) { ur.cancel() }
@@ -2326,7 +2579,11 @@ struct SettingsPage: View {
             }
         }
         .padding(50)
-        .onAppear { m.checkUpdate() }
+        .onAppear {
+            m.checkUpdate()
+            m.saved = false   // 「已保存」提示不跨次访问残留(model 现在常驻)
+            m.resetConnectionDraft()   // 没点确认的 host/port 切页回退
+        }
         }
         // 点空白处 = 提交当前输入框(同模型表单), 提示符随之消失
         .contentShape(Rectangle())
@@ -2348,6 +2605,10 @@ struct SettingsPage: View {
             .onChange(of: lines.count) {
                 proxy.scrollTo("tail", anchor: .bottom)
             }
+            .onAppear {
+                // 同 EnvPage.logBox: 页面重建后首次显示停在末尾
+                DispatchQueue.main.async { proxy.scrollTo("tail", anchor: .bottom) }
+            }
         }
     }
 
@@ -2368,7 +2629,11 @@ struct SettingsPage: View {
             Button {
                 if m.pinned.contains(path) { m.pinned.remove(path) }
                 else { m.pinned.insert(path) }
-                app.settings.pinnedEndpoints = Array(m.pinned)
+                // sorted (not Array(set)): a Set's iteration order is
+                // non-deterministic, so Array(m.pinned) would rewrite the
+                // pinned-endpoints line in a random order on every save.
+                // Sorted matches the 置顶 group's display order (audit D10).
+                app.settings.pinnedEndpoints = m.pinned.sorted()
                 app.settings.save()
             } label: {
                 Image(systemName: m.pinned.contains(path) ? "pin.fill" : "pin")
@@ -2502,7 +2767,6 @@ struct DashboardView: View {
 
 final class DashboardApp: NSObject {
     let model = DashboardModel()
-    let logStore = LogStore()
     private var window: NSWindow?
     private var app: AppDelegate!
 
@@ -2524,8 +2788,11 @@ final class DashboardApp: NSObject {
                 backing: .buffered, defer: false)
             w.title = T("Corral 控制面板")
             w.isReleasedWhenClosed = false
+            // the APP's logStore — all appendLogLine calls (menubar events
+            // + router output) land there; this class used to pass its own
+            // empty instance, so the 日志 page showed nothing
             w.contentViewController = NSHostingController(
-                rootView: DashboardView(model: model, logStore: logStore, app: app))
+                rootView: DashboardView(model: model, logStore: app.logStore, app: app))
             w.setContentSize(NSSize(width: 1080, height: 720))
             w.minSize = NSSize(width: 880, height: 540)
             w.center()

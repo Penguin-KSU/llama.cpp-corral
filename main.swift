@@ -2,11 +2,16 @@ import AppKit
 import ServiceManagement
 
 // fork() is marked unavailable in the Swift overlay ("use posix_spawn").
-// We need the fork+exec pattern because the child must become a process
-// group leader BEFORE exec — posix_spawn cannot express that on macOS
-// (SETPGROUP with pgid 0 leaves the child in the parent's group). The
-// child only performs async-signal-safe C calls before exec, the safe
-// usage pattern for fork in a multithreaded app.
+// We need the fork+exec pattern because the spawned tree must run in its
+// OWN process group (so it can be killed as a unit — including model
+// server orphans left behind after the router dies) and posix_spawn has
+// no hook to run setpgid() between fork and exec. The parent calls
+// setpgid(child, child) right after fork (classic job-control pattern).
+// Note: the parent cannot regroup a posix_spawned child either —
+// setpgid(child, child) right after Process.run() fails with EPERM on
+// macOS (verified 2026-09) — so anything that must own its process group
+// has to fork. The child only performs async-signal-safe C calls before
+// exec, the safe usage pattern for fork in a multithreaded app.
 @_silgen_name("fork")
 func sys_fork() -> pid_t
 
@@ -133,16 +138,6 @@ struct Settings {
         try? fm.createDirectory(atPath: SETTINGS_DIR, withIntermediateDirectories: true)
         // no settings/model seed: a fresh install starts empty (empty port =
         // llama.cpp default 8080; models are added via the dashboard)
-        // give extensionless config files the .llm extension so Finder
-        // knows which app opens them
-        for f in (try? fm.contentsOfDirectory(atPath: CONFIG_DIR)) ?? [] where !f.hasPrefix(".") {
-            if !f.hasSuffix(CONFIG_EXT) {
-                let dst = CONFIG_DIR + "/" + f + CONFIG_EXT
-                if !fm.fileExists(atPath: dst) {
-                    try? fm.moveItem(atPath: CONFIG_DIR + "/" + f, toPath: dst)
-                }
-            }
-        }
     }
 }
 
@@ -219,8 +214,6 @@ func migrateConfigFiles() -> [String] {
     return msgs
 }
 
-// MARK: - Icons
-
 // MARK: - Log sink
 
 final class LogSink {
@@ -235,12 +228,25 @@ final class LogSink {
             try? "".write(toFile: file, atomically: false, encoding: .utf8)
         }
         fh = FileHandle(forWritingAtPath: file)
+        // forWritingAtPath opens at offset 0, NOT at the end: without this,
+        // every app launch would overwrite the oldest log content in place
+        // (the file silently loses everything older than the newest session)
+        fh?.seekToEndOfFile()
     }
 
     func append(_ data: Data) {
         queue.async {
             self.fh?.write(data)
             self.pending.append(data)
+            // cap the line buffer: a newline-free stretch (e.g. a \r progress
+            // bar) must not grow it without bound. pending only feeds the UI
+            // line callback (the file is written in full above), so dropping
+            // the oldest bytes only truncates an abnormally long line in the
+            // log view — never the file. llama.cpp output is line-based, so
+            // this is a defense against a pathological backend, not a live fix.
+            if self.pending.count > 1_000_000 {
+                self.pending.removeSubrange(0..<(self.pending.count - 65_536))
+            }
             while let idx = self.pending.firstIndex(of: 0x0A) {
                 let lineData = self.pending.subdata(in: 0..<idx + 1)
                 self.pending.removeSubrange(0..<idx + 1)
@@ -297,9 +303,9 @@ final class RouterProc {
             return "fork() failed"
         }
         if child == 0 {
-            // child: group leader, stdout/stderr -> log pipe, then exec.
-            // Only async-signal-safe C calls from here on.
-            setpgid(0, 0)
+            // child: stdout/stderr -> log pipe, then exec.
+            // Only async-signal-safe C calls from here on. (The parent
+            // moves this process into its own process group — see below.)
             if chdir(cCwd) != 0 { _exit(127) }
             dup2(writeFd, 1)
             dup2(writeFd, 2)
@@ -313,10 +319,17 @@ final class RouterProc {
 
         generation += 1
         pid = child
-        let g = getpgid(child)
-        // 0 => the child did not become a group leader; stop() must then
-        // never group-kill (the group would be the app's own)
-        pgid = (g == child) ? child : 0
+        // The parent sets the child's process group right after fork
+        // (classic job-control pattern — shells do exactly this). Deliberately
+        // NOT in the child: the old child-side setpgid(0,0) + parent-side
+        // getpgid() query raced the scheduler and saw the OLD group
+        // 200/200 times in testing, silently disabling the group-kill
+        // (audit A2). A parent-side call is race-free: it holds no matter
+        // when the child is scheduled, even if it already exec'd. Rare
+        // failure (child already gone) degrades to single-pid kill; the
+        // EOF path handles a dead child either way. 0 => never group-kill
+        // (the child would still be in the app's own group).
+        pgid = (setpgid(child, child) == 0) ? child : 0
         let h = FileHandle(fileDescriptor: fds[0], closeOnDealloc: false)
         readHandle = h
         h.readabilityHandler = { [weak self] handle in
@@ -386,9 +399,13 @@ func isRunningStatus(_ s: String) -> Bool {
 
 final class RouterAPI {
     let port: Int
-    init(port: Int) { self.port = port }
+    let host: String
+    init(port: Int, host: String = "127.0.0.1") { self.port = port; self.host = host }
 
-    private func url(_ path: String) -> URL { URL(string: "http://127.0.0.1:\(port)\(path)")! }
+    private func url(_ path: String) -> URL {
+        let h = host.contains(":") ? "[\(host)]" : host   // IPv6 字面量要套括号
+        return URL(string: "http://\(h):\(port)\(path)")!
+    }
 
     private func request(_ req: URLRequest) -> (Data, HTTPURLResponse)? {
         let sem = DispatchSemaphore(value: 0)
@@ -400,7 +417,11 @@ final class RouterAPI {
             sem.signal()
         }
         task.resume()
-        _ = sem.wait(timeout: .now() + req.timeoutInterval + 2)
+        // 超时即取消: 不养僵尸请求(socket 立刻释放)。cancel 后 completion
+        // 带 error、data=nil, result 保持 nil, 行为与不取消一致(审计 D2)
+        if sem.wait(timeout: .now() + req.timeoutInterval + 2) == .timedOut {
+            task.cancel()
+        }
         return result
     }
 
@@ -451,7 +472,11 @@ final class RouterAPI {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var settings = Settings.load()
-    var api: RouterAPI!
+    // computed, not stored: RouterAPI is stateless (just a port), and this
+    // way it always reflects the CURRENT settings.port — a stored instance
+    // went stale after a port change and every health/model call hit the
+    // old port until the app was relaunched (audit A3)
+    var api: RouterAPI { RouterAPI(port: currentPublicPort, host: currentPublicHost) }
     var proc = RouterProc()
     var log: LogSink!
     var statusItem: NSStatusItem!
@@ -471,6 +496,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var routerStartedAt = Date.distantPast
     var recovering = false
     var restartTimes: [Date] = []
+    // latched on crash-loop give-up: auto-restart stays off until the app
+    // is relaunched (the give-up alert says exactly that; a fresh process
+    // starts unlatched). Dedicated flag, not routerDead: that one means
+    // "the instance is done" (quit / relaunchSelf) and would also freeze
+    // the health polling, leaving the dashboard stale after a manual
+    // router restart (audit A8).
+    var restartSuspended = false
+    // 代理启动失败时回滚 router 后置位: 挡住 recoverRouter(否则健康轮询
+    // 会无限重启一个必然再失败的拓扑); 用户切开关/改连接设置时清除
+    // (审计 B7)。同 restartSuspended 的 latched 约定, app 重启自然清零。
+    var proxyStartFailed = false
+    // 升级/编译并生效 触发的重启: waitRouterHealthy 有 120s 自己的耐心,
+    // 期间挂起健康轮询的恢复(否则 90s 宽限先到期会误杀慢启动 router,
+    // 每轮 ~96s > 60s crash-loop 窗口,无限循环 —— 审计 B8)。
+    // 只在健康轮询路径生效;onExit → recoverRouter 不受影响。
+    var upgradeWaitInFlight = false
 
     var modelsSubmenu: NSMenu!
     var loginItem: NSMenuItem!
@@ -480,11 +521,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let dashboard = DashboardApp()
     let logStore = LogStore()
     let upgradeRunner = UpgradeRunner()
+    // 页面状态记录本: 挂在 app 主体上, 切页不销毁(曾在页面视图的
+    // @StateObject 上, 切走即丢: 用户输入/事件记录没了, 进行中的编译
+    // 只剩灰按钮, 取消和完成回调一起被扔)
+    lazy var envModel = EnvPageModel(app: self)
+    lazy var settingsModel = SettingsFormModel(app: self)
+    let selfUpdateRunner = UpgradeRunner()   // 设置页 Corral 自更新专用, 与 upgradeRunner 互不干扰
 
     func applicationDidFinishLaunching(_ note: Notification) {
         Settings.firstRunSetup()
         settings = Settings.load()
-        api = RouterAPI(port: settings.port ?? 8080)
 
         log = LogSink(file: LOG_FILE)
         log.onLine = { [weak self] line in self?.appendLogLine(line) }
@@ -531,11 +577,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if api.health() {
             let alert = NSAlert()
             alert.messageText = T("检测到残留的 llama.cpp 进程")
-            alert.informativeText = TF("端口 %d 被上次未正常退出的 llama.cpp 实例占用，要杀掉它并重新开始吗？", settings.port ?? 8080)
+            alert.informativeText = TF("端口 %d 被上次未正常退出的 llama.cpp 实例占用，要杀掉它并重新开始吗？", currentPublicPort)
             alert.addButton(withTitle: T("杀掉"))
             alert.addButton(withTitle: T("取消"))
             if alert.runModal() == .alertFirstButtonReturn {
-                killLeftoverOnPort(settings.port ?? 8080)
+                killLeftoverOnPort(currentPublicPort)
                 Thread.sleep(forTimeInterval: 1)
             } else {
                 NSApp.terminate(nil)
@@ -677,7 +723,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Cheap detection chain, safe to run on every launch:
     //  1. a recorded source dir that still looks like a working build
     //  2. the official one-line install location (~/.llama-app)
-    //  3. a copy on PATH (~/.local/bin, where the official installer puts one)
+    //  ~/.local/bin/llama is deliberately NOT auto-detected: identity is
+    //  location-based, and that path often holds a symlink to a self-built
+    //  binary — treating it as the official prebuilt would mislabel it and
+    //  offer "re-run the official installer", which overwrites the symlink
+    //  (audit B3). A bare PATH binary can still be used via the 设置 bin field.
     // Results are persisted so the next launch starts from the same place.
     func detectEnv() -> LlamaEnv {
         let fm = FileManager.default
@@ -711,13 +761,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             settings.src = ""
             settings.save()
             appendLogLine("[menubar] detected official llama.cpp at ~/.llama-app")
-            return .official
-        }
-        if fm.isExecutableFile(atPath: home + "/.local/bin/llama") {
-            settings.bin = home + "/.local/bin"
-            settings.src = ""
-            settings.save()
-            appendLogLine("[menubar] detected llama at ~/.local/bin/llama")
             return .official
         }
         return .none
@@ -773,6 +816,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // (同一 bundle id), 于是下面的 terminate 会把 app 直接关掉而不是重启;
     // -n 强制开一个新实例, 新二进制才真正起来。
     func relaunchSelf() {
+        // Same shutdown convention as applicationWillTerminate: this
+        // instance stops managing the router and never starts it again.
+        // Without routerDead the killed tree's stale EOF (queued on the
+        // main queue during the 1.5s window below) passes both onExit
+        // guards — generation only bumps on start(), and this path never
+        // starts — so recoverRouter rebinds the port just before the new
+        // instance launches → false 残留 llama.cpp 进程 modal (audit A5).
+        routerDead = true
         proc.stop()
         stopProxy()
         loadedNames = []
@@ -910,7 +961,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func gitDirtyCount(_ src: String) -> Int {
-        let out = gitRun(["-C", src, "status", "--porcelain"])
+        // 未跟踪文件不算脏: checkout 不会碰它们, 唯一的真冲突(目标分支
+        // 同路径文件)由 git 自己拒绝 checkout 并报清晰错误(审计 B12)。
+        // 否则一个 .DS_Store/模型文件就能永久锁死分支切换。
+        let out = gitRun(["-C", src, "status", "--porcelain", "--untracked-files=no"])
         return out.split(separator: "\n").count
     }
 
@@ -963,6 +1017,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let ahead = count("HEAD.." + ref),
               let behind = count(ref + "..HEAD") else { return nil }
         return (ahead, behind)
+    }
+
+    // commits in `range` (e.g. "origin/foo..foo"); nil = range unresolvable.
+    // gitRun drops stderr, so a missing ref yields empty stdout → nil —
+    // that is how callers tell "local branch doesn't exist" apart from a count.
+    func gitRevCount(_ src: String, _ range: String) -> Int? {
+        let c = gitRun(["-C", src, "rev-list", "--count", range])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Int(c)
+    }
+
+    // does the current branch have an upstream (so `git pull` would work);
+    // same rev-parse trick as gitBehindInfo — non-empty output = yes
+    func gitHasUpstream(_ src: String) -> Bool {
+        !gitRun(["-C", src, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     // how far the current branch trails its upstream ("官方领先 N 个提交")
@@ -1020,7 +1090,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         var args = ["serve", "--port", String(port)]
         args += ["--models-preset", PRESET_FILE]
-        if !settings.host.isEmpty { args += ["--host", settings.host] }
+        // 代理 ON 时公网口由代理占(恒回环),内部 router 不需 --host;
+        // 传了反而让 router 绑到非回环地址、代理拨不通(审计 B2)
+        if !settings.host.isEmpty && !settings.audioProxy { args += ["--host", settings.host] }
         if let err = proc.start(executable: exe, args: args, cwd: settings.bin, log: log) {
             appendLogLine("[menubar] router start failed: \(err)")
             let alert = NSAlert()
@@ -1049,10 +1121,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                            routerPort: routerInternalPort, log: appendLogLine)
         if let err = a.start() {
             appendLogLine("[menubar] proxy start failed: \(err)")
+            // 回滚: 不留不可达的 router 在内部端口占显存(半死状态);
+            // 置 latch 挡住健康路径的无限重启; 清 loadedNames 是因为
+            // latch 让 recoverRouter 提前返回, 它自己的清理到不了(审计 B7)
+            routerUp = false
+            loadedNames = []
+            updateIcon()
+            proxyStartFailed = true
             let alert = NSAlert()
             alert.messageText = T("音频转码代理启动失败")
-            alert.informativeText = err
+            alert.informativeText = err + "\n\n" + T("router 已一并停止。请释放被占用的端口后,重新切换开关重试。")
+            alert.addButton(withTitle: T("知道了"))
             alert.runModal()
+            proc.stop()
             return
         }
         proxy = a
@@ -1079,6 +1160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.audioProxy = on
         settings.save()
         ProxyState.shared.enabled = on
+        proxyStartFailed = false   // 用户显式重切 = 重试(审计 B7)
         appendLogLine("[proxy] audio transcoding \(on ? "enabled" : "disabled") — restarting router")
         loadedNames = []
         updateIcon()
@@ -1088,6 +1170,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     var currentPublicPort: Int { settings.port ?? 8080 }
+    // 本机回环地址:空/通配(0.0.0.0、::)时 router 绑在回环或全接口,
+    // 用 127.0.0.1 拨即可;具体地址(局域网 IP 等)原样拨(app 与
+    // router 同机,连自己的局域网 IP 没问题)——审计 B2
+    var currentPublicHost: String {
+        // 代理 ON: 公开端口由代理占, 代理恒绑回环 —— 无论 host 设置是
+        // 什么, app 自己永远拨 127.0.0.1(否则 host = 局域网 IP 时拨
+        // LAN IP:公开端口无监听 → health 恒失败 → 95s 自杀循环, 审计 B7)
+        if settings.audioProxy { return "127.0.0.1" }
+        let h = settings.host
+        if h.isEmpty || h == "0.0.0.0" || h == "::" { return "127.0.0.1" }
+        return h
+    }
     var ffmpegPath: String? { AudioProxy.findFFmpeg() }
 
     var refreshing = false
@@ -1105,8 +1199,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let list = healthy ? self.api.models() : nil
             DispatchQueue.main.async {
                 self.refreshing = false
+                // the success branch below only runs when healthy — without
+                // this, the green dot stays lit after any crash (stale)
+                if !healthy { self.dashboard.model.routerReady = false }
                 if healthy { self.unhealthyPolls = 0 }
-                else if Date().timeIntervalSince(self.routerStartedAt) > 90 {
+                else if Date().timeIntervalSince(self.routerStartedAt) > 90, !self.upgradeWaitInFlight {
                     self.noteRouterUnhealthy()
                 } else {
                     self.unhealthyPolls = 0 // don't bank failures across the grace boundary
@@ -1136,6 +1233,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // restart the router so this app stays the single manager. Models are
     // re-loaded on demand by the router, so clients just keep working.
     func recoverRouter() {
+        if restartSuspended {
+            // at most one line per incident: with the router dead and
+            // routerUp false, no further recoverRouter events can arrive
+            appendLogLine("[menubar] auto-restart suspended (crash loop); not restarting")
+            return
+        }
+        if proxyStartFailed {
+            appendLogLine("[menubar] proxy failed; router stopped; not restarting")
+            return
+        }
         guard !routerDead, !recovering else { return }
         recovering = true
         appendLogLine("[menubar] router unresponsive; killing leftover llama processes")
@@ -1151,6 +1258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let now = Date()
                 self.restartTimes.removeAll { now.timeIntervalSince($0) > 60 }
                 if self.restartTimes.count >= 3 {
+                    self.restartSuspended = true
                     self.appendLogLine("[menubar] router keeps crashing; giving up")
                     self.showAlert(T("router 反复崩溃"),
                         T("router 在 60 秒内多次退出，已停止自动重启。请查看 log 排查原因后重新打开本应用。"))
@@ -1273,7 +1381,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // double-clicking a .llm config file in Finder launches us with the file
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls where url.path.hasSuffix(CONFIG_EXT) {
+        for url in urls {
+            guard url.path.hasSuffix(CONFIG_EXT) else { continue }
+            // Corral is the system handler for .llm (CFBundleDocumentTypes),
+            // but only files in config/ are ours: anything else would open a
+            // phantom/foreign model form, and saving it would create a new
+            // config out of thin air (audit B9)
+            let parent = url.deletingLastPathComponent().standardizedFileURL.path
+            guard parent == CONFIG_DIR else {
+                appendLogLine("[menubar] ignored .llm outside config/: \(url.path)")
+                continue
+            }
             let id = (url.lastPathComponent as NSString).deletingPathExtension
             dashboard.show(page: .models, modelsTab: .list, editing: id)
         }
@@ -1303,6 +1421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func saveConnection(host: String, port: Int?) {
         settings.host = host.trimmingCharacters(in: .whitespaces)
         settings.port = port
+        proxyStartFailed = false   // 拓扑变了, 允许自动恢复(审计 B7)
         settings.save()
         appendLogLine("[menubar] connection saved (host=\(settings.host.isEmpty ? "default" : settings.host), port=\(port.map(String.init) ?? "default")) — restarting router")
         restartRouter(message: T("连接设置已保存,正在重启 router 生效"))
@@ -1372,8 +1491,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: log (viewed in the dashboard's 日志 page)
 
+    // wall-clock prefix for the 日志 page (router lines carry llama.cpp's
+    // own relative timestamps, but menubar/proxy lines had none at all —
+    // useless for correlating events, e.g. the A8 crash-loop verification)
+    private static let logTimestamp: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
     func appendLogLine(_ line: String) {
-        logStore.append(line)
+        logStore.append("[\(Self.logTimestamp.string(from: Date()))] \(line)")
     }
 
     // MARK: helpers

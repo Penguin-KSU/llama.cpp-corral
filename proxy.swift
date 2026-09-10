@@ -270,8 +270,14 @@ final class AudioProxy {
 
     private func decide(_ c: Conn, head: Data) {
         guard let req = parseHead(head) else { pipeToRouter(c, first: head); return }
+        // match on the path portion only: a client that appends a query
+        // string (?model=...) would break an exact match and silently skip
+        // transcoding — the raw WebM would be piped through and the router
+        // would 400 it. Forwarding still uses the full req.path, so the
+        // router sees the original request line unchanged (audit D9).
+        let pathOnly = req.path.split(separator: "?").first.map(String.init) ?? req.path
         let isTranscription = req.method == "POST"
-            && (req.path == "/v1/audio/transcriptions" || req.path == "/audio/transcriptions")
+            && (pathOnly == "/v1/audio/transcriptions" || pathOnly == "/audio/transcriptions")
         let contentType = req.headers["content-type"] ?? ""
         if isTranscription,
            contentType.lowercased().hasPrefix("multipart/form-data"),
