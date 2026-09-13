@@ -611,11 +611,16 @@ final class AudioProxy {
                        "-ar", "16000", "-ac", "1", "-f", "wav", outPath]
         let errPipe = Pipe()
         p.standardError = errPipe
-        p.standardOutput = Pipe()
+        // stdout 恒空(输出写文件), nullDevice 堵死同族孪生洞
+        p.standardOutput = FileHandle.nullDevice
         try p.run()
+        // P1-4 同族洞修复(2026-09 定案, 照抄 main.swift gitRun 已验证模式):
+        // 先排空 stderr 再 wait —— ffmpeg 错误输出超 64KB 时管道满,
+        // 子进程阻塞写、父进程阻塞 wait 互等死锁, 且占死代理串行队列
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         guard p.terminationStatus == 0 else {
-            let msg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            let msg = String(data: errData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? "exit \(p.terminationStatus)"
             throw TranscodeError.ffmpegFailed(msg)
         }

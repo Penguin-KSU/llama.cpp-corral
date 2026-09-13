@@ -12,9 +12,10 @@ no more typing the same commands every time.
   on crash, and detects/cleans up stale processes and port conflicts
 - Multi-model management: one `*.llm` parameter file per model, one-click
   load/unload from the menu bar
-- Native SwiftUI dashboard: visual editing of model parameters (~210
-  llama-server options, frequently used ones pinnable), live logs, settings
-  (port, API endpoint list)
+- Native SwiftUI dashboard (v2.0: redesigned to be simple and
+  human-friendly): visual editing of model parameters (~210 llama-server
+  options — pin the ones you use, reorder them with one click, fuzzy
+  search), live logs, settings (port, API endpoint list)
 - llama.cpp build management: detects what you have, adopts and switches
   between multiple local builds (official prebuilt / self-built / fork),
   upgrades with one click (source builds: pull + rebuild + auto-restart),
