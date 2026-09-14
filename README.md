@@ -70,17 +70,25 @@ cd llama.cpp-corral
 
 1. Run the app — a llama icon appears in the menu bar
 2. Open the Dashboard (menu bar, or click the Dock icon while the app is
-   running) → Models → Add Model, and fill in the GGUF path and your usual
-   parameters
+   running) → Models → Add Model, and fill in the GGUF path, an optional
+   name, and your usual parameters
 3. Click the menu bar icon → model → load/unload
 
 ## Model parameter files (`*.llm`)
 
 One file per model, `key = value` format; keys are llama.cpp command-line
-option names. **Model id = file name without the `.llm` suffix** (always the
-GGUF's real name); an optional `# display-name: My Model` comment line adds a
-display-only alias in the UI. Left-empty parameters are not written, so
-llama.cpp uses its official defaults.
+option names. **Model id = file name without the `.llm` suffix** — and the
+name you give a model in the dashboard becomes exactly that file name. Leave
+the name empty and the GGUF's real name is used instead. A file named
+`MyModel-250K.llm` serves model id `MyModel-250K`:
+
+Because the name *is* the id, the same GGUF file can carry several configs
+side by side — e.g. a 128K-context and a 250K-context variant of one model,
+each loadable and unloadable as its own model. Names must be unique across
+`config/`, must not contain `/`, and must not end in a file extension
+(`.gguf`, `.llm`, …). The dashboard's "Duplicate as New Config" button copies
+a saved config under a new name, for exactly this. Left-empty parameters are
+not written, so llama.cpp uses its official defaults.
 
 ```ini
 model              = /path/to/your-model.gguf
@@ -95,6 +103,10 @@ top-p              = 0.95
 
 On launch the app merges all `.llm` files into `.router-preset.ini` and passes
 it to llama.cpp via `--models-preset`. Don't edit that generated file by hand.
+
+Legacy files written by older versions (file named after the GGUF, custom
+name kept in a `# display-name:` comment) are migrated automatically on
+launch: the alias moves into the file name.
 
 ## Data directory
 

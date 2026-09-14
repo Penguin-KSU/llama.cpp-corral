@@ -290,8 +290,9 @@ struct LlmFile {
     var order: [String]      // key order as written to the file
     var pinned: [String]
     var manual: [String] = []
-    // display-only alias ("# display-name:" comment); the router model
-    // id is always the GGUF's real name, never this
+    // legacy display alias ("# display-name:" comment): pre-2026-09 files
+    // only — the startup migration moves it into the filename, and new
+    // saves never write it
     var displayName = ""
 
     static func parse(_ text: String) -> LlmFile {
@@ -427,12 +428,15 @@ final class FormModel: ObservableObject {
     @Published var pinned: [String]
     @Published var manual: [String] = []   // 基本 card left column (ordered)
     @Published var ggufPath = ""     // "model" key (add/edit modes)
-    @Published var customName = ""   // display-only alias (add + edit modes)
+    @Published var modelName = ""    // 模型 ID(add + edit):= 文件名;留空 = GGUF 真名
+    var isLoaded: () -> Bool = { false }   // 视图注入;已加载的模型禁止改名
+    // save() 改名成功时置为新的 id,由页面消费(切下拉 + 换表单)
+    var renamedTo: String? = nil
     @Published var justSaved = false
     @Published var dirty = false      // 有未保存修改(底部栏橙色圆点)
     // 状态式 dirty:baseline = 加载/上次保存/上次重播种时的参数面。
     // 每次变更实时比较——改了又改回去,圆点立刻灭(事件式要手动保存
-    // 才消)。模型路径/自定义名称不进 baseline(填路径不亮点的旧语义)
+    // 才消)。模型路径/模型 ID 不进 baseline(填路径不亮点的旧语义)
     private var baseline: (values: [String: String], pinned: [String], manual: [String]) = ([:], [], [])
 
     // values 里空值 = 键不存在(setValue 写入 nil 即删键);防御性过滤
@@ -482,7 +486,7 @@ final class FormModel: ObservableObject {
             values = f.values; order = f.order; manual = f.manual
             pinned = Self.fallbackPins(f)
             ggufPath = f.values["model"] ?? ""
-            customName = f.displayName
+            modelName = id   // 2026-09:名字 = 文件名;启动迁移后两者恒一致
         }
         syncCustomKeys()
         baseline = (values: effectiveValues, pinned: pinned, manual: manual)
@@ -509,10 +513,11 @@ final class FormModel: ObservableObject {
         (f.pinned.isEmpty && f.manual.isEmpty) ? DEFAULT_PINS : f.pinned
     }
 
-    // model id = always the GGUF filename without extension (stable,
-    // visible to external tools); the custom name is display-only
+    // 目标模型 ID:自定义名优先,留空回退 GGUF 真名(2026-09 定案)
     var targetID: String {
-        URL(fileURLWithPath: ggufPath).deletingPathExtension().lastPathComponent
+        let n = modelName.trimmingCharacters(in: .whitespaces)
+        if !n.isEmpty { return n }
+        return URL(fileURLWithPath: ggufPath).deletingPathExtension().lastPathComponent
     }
 
     // single write path for parameter values: keeps `order` in sync.
@@ -560,13 +565,25 @@ final class FormModel: ObservableObject {
             try? LlmFile(values: v, order: o, pinned: pinned, manual: manual).text()
                 .write(toFile: GLOBAL_FILE, atomically: true, encoding: .utf8)
         case .add:
-            let id = targetID
-            guard !id.isEmpty else { return T("模型路径必填") }
-            try? LlmFile(values: v, order: o, pinned: pinned, manual: manual, displayName: customName).text()
+            let gguf = URL(fileURLWithPath: ggufPath).deletingPathExtension().lastPathComponent
+            let r = resolveModelName(modelName, ggufName: gguf)
+            guard r.error == nil, let id = r.id else { return r.error }
+            try? LlmFile(values: v, order: o, pinned: pinned, manual: manual).text()
                 .write(toFile: CONFIG_DIR + "/" + id + CONFIG_EXT, atomically: true, encoding: .utf8)
         case .edit(let id):
-            try? LlmFile(values: v, order: o, pinned: pinned, manual: manual, displayName: customName).text()
-                .write(toFile: CONFIG_DIR + "/" + id + CONFIG_EXT, atomically: true, encoding: .utf8)
+            let gguf = URL(fileURLWithPath: ggufPath).deletingPathExtension().lastPathComponent
+            let r = resolveModelName(modelName, ggufName: gguf, excludeID: id)
+            guard r.error == nil, let newID = r.id else { return r.error }
+            let text = LlmFile(values: v, order: o, pinned: pinned, manual: manual).text()
+            if newID != id {
+                // 改名 = move;已加载的模型必须先卸载(用户自己卸)
+                if isLoaded() { return T("模型正在加载,请先卸载再改名") }
+                try? text.write(toFile: CONFIG_DIR + "/" + newID + CONFIG_EXT, atomically: true, encoding: .utf8)
+                try? FileManager.default.removeItem(atPath: CONFIG_DIR + "/" + id + CONFIG_EXT)
+                renamedTo = newID
+            } else {
+                try? text.write(toFile: CONFIG_DIR + "/" + id + CONFIG_EXT, atomically: true, encoding: .utf8)
+            }
         }
         baseline = (values: effectiveValues, pinned: pinned, manual: manual)
         dirty = false
@@ -633,7 +650,7 @@ final class FormModel: ObservableObject {
 
     // 整体重播种:参数面(值/顺序/图钉/手动区)整体换成 global.llm 的内容。
     // 两条对齐路共用:自动(全局页「保存」成功后)+ 手动(添加页
-    // 「重置为全局参数」)。路径与自定义名称不碰(模型专属信息,不属于
+    // 「重置为全局参数」)。路径与模型 ID 不碰(模型专属信息,不属于
     // 全局种子)。对齐后的内容不是用户的待保存劳动,橙点灭。
     func reseedFromGlobal() {
         let f = LlmFile.read(GLOBAL_FILE)
@@ -952,10 +969,10 @@ struct DenseRow: View {
             }
             TextField("default (\(T(param.def)))", text: valueBinding)
                 .textFieldStyle(.plain)
-                // 已设值 = 常规正文字色(primary, 明暗自动适配; 2026-09 修订:
-                // 蓝 + semibold 推翻, 深色模式下蓝字对比度低看不清); 空值灰占位
+                // 已设值 = 系统绿(setTint, 明暗双模式自动适配; 修订史:
+                // 蓝 + semibold 推翻 → 默认正文字色 → 系统青 → 系统绿试用); 空值灰占位
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(isSet ? Color.primary : .secondary)
+                .foregroundStyle(isSet ? Self.setTint : .secondary)
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
@@ -980,6 +997,12 @@ struct DenseRow: View {
             set: { nv in fm.setValue(self.param.key, nv) })
     }
 
+    // 已填值的字色: 系统绿 = NSColor 动态色, 浅色 ≈#34C759 / 深色 ≈#30D158,
+    // 系统保证明暗两模式都舒服(固定亮蓝在深色刺眼被推翻, 见 24b89ab)。
+    // 空值仍是灰占位, 框/字重/占位色不变。单一数据源, 5 处共用;
+    // 橙色保留给「未保存草稿」状态点, 不混用
+    static let setTint = Color(nsColor: .systemGreen)
+
     // 值列宽按控件类型分档(oMLX 式: 右对齐, 宽度随类型, 不必齐平);
     // 路径行最宽(要装下长路径 + 浏览按钮)
     static let controlWidth: CGFloat = 130
@@ -987,7 +1010,7 @@ struct DenseRow: View {
 
     // 原生式值列(2026-09 用户定案): 文本类控件(plain TextField 自身无框)
     // 包一层浅灰半透明底 + 细实线边 + 5pt 圆角的原生式输入框, 框恒定不变形,
-    // 状态只靠字色表达(空 = 灰占位 / 已设 = 黑正文), 半透明 primary 自动适配
+    // 状态只靠字色表达(空 = 灰占位 / 已设 = 系统绿), 半透明 primary 自动适配
     // 明暗模式。原生 pop-up 自带白底圆角边框, 不再外包, 否则「框中框」
     // (里白外灰双层边)。bool 和 choice 都渲染成 pop-up(布尔 = default/on/off
     // 三选项下拉), 两个分支都要豁免
@@ -1100,9 +1123,9 @@ struct DenseRow: View {
             .labelsHidden()
             .controlSize(.small)
             // 原生 pop-up 只认颜色不认字重(2026-09-12 真机验证, d40e614 的
-            // 下拉加粗无效已回退): 已设 = 正文字色, 空 = 灰占位
+            // 下拉加粗无效已回退): 已设 = 系统绿, 空 = 灰占位
             .font(.system(size: 11, design: .monospaced))
-            .foregroundStyle(isSet ? Color.primary : .secondary)
+            .foregroundStyle(isSet ? Self.setTint : .secondary)
         case .choice(let choices):
             if param.allowCustom, fm.customKeys.contains(param.key) {
                 customChoiceControl
@@ -1115,14 +1138,14 @@ struct DenseRow: View {
                 .labelsHidden()
                 .controlSize(.small)
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(isSet ? Color.primary : .secondary)
+                .foregroundStyle(isSet ? Self.setTint : .secondary)
             }
         case .path:
             HStack(spacing: 6) {
                 TextField("default (\(T(param.def)))", text: valueBinding)
                     .textFieldStyle(.plain)
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(isSet ? Color.primary : .secondary)
+                    .foregroundStyle(isSet ? Self.setTint : .secondary)
                     .lineLimit(1)
                 Button(T("浏览…")) {
                     let panel = NSOpenPanel()
@@ -1139,7 +1162,7 @@ struct DenseRow: View {
             TextField("default (\(T(param.def)))", text: valueBinding)
                 .textFieldStyle(.plain)
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(isSet ? Color.primary : .secondary)
+                .foregroundStyle(isSet ? Self.setTint : .secondary)
         }
     }
 }
@@ -1152,6 +1175,7 @@ struct FormView: View {
     @ObservedObject var l10n = L10n.shared   // re-render on language switch
     var onSaved: () -> Void
     var onDelete: (() -> Void)? = nil
+    var onDuplicate: (() -> Void)? = nil
     // 功能栏(模型页顶栏): 固定不动, 无底色无分隔线(2026-09-11 用户定案
     // 去掉磨砂灰底), 内容在栏下方滚动, 不从栏底下穿过
     let header: AnyView
@@ -1263,9 +1287,9 @@ struct FormView: View {
             if !searching, fm.mode == .add || fm.mode.isEdit {
                 fixedFieldRow("model", value: $fm.ggufPath, placeholder: T("GGUF 文件路径(必填)"), browse: true,
                               readOnly: fm.mode.isEdit)
-                // 显示别名: 只影响 UI 显示, 模型 ID 恒为 GGUF 真名
-                fixedFieldRow(T("自定义名称"), value: $fm.customName, placeholder: T("留空 = 显示文件名"), browse: false)
-                if fm.mode == .add, !fm.targetID.isEmpty {
+                // 模型 ID(2026-09):名字 = 文件名 = id;留空 = GGUF 真名
+                fixedFieldRow(T("自定义模型ID"), value: $fm.modelName, placeholder: T("留空 = GGUF 真名"), browse: false)
+                if fm.mode == .add, !fm.ggufPath.isEmpty, !fm.targetID.isEmpty {
                     Text(TF("将保存为 config/%@.llm", fm.targetID))
                         .font(.caption).foregroundStyle(.secondary)
                         .padding(.leading, 12).padding(.bottom, 4)
@@ -1591,7 +1615,7 @@ struct FormView: View {
                 // 二次确认,防误触。添加页的重置 = 整体重播种(与全局
                 // 保存后的自动对齐同一动作),其余两页 = 清参数值
                 if fm.mode == .add {
-                    if confirmAlert(T("重置为全局参数"), T("将清空所有已填参数并对齐到当前已保存的全局参数(模型路径与自定义名称不受影响)。点「保存」后才会写入文件。"), ok: T("重置")) {
+                    if confirmAlert(T("重置为全局参数"), T("将清空所有已填参数并对齐到当前已保存的全局参数(模型路径与自定义模型ID 不受影响)。点「保存」后才会写入文件。"), ok: T("重置")) {
                         fm.reseedFromGlobal()
                     }
                 } else {
@@ -1599,6 +1623,10 @@ struct FormView: View {
                         fm.resetAll()
                     }
                 }
+            }
+            if fm.mode.isEdit, let dup = onDuplicate {
+                // 复制为新配置:以磁盘已保存参数为底建新模型,原模型不动
+                Button(T("复制为新配置")) { dup() }
             }
             Spacer()
             if let del = onDelete {
@@ -1703,11 +1731,11 @@ struct ModelsPage: View {
                         .buttonStyle(.plain)
                     }
                 }
-            // GGUF 真名(传给其他 agent 的模型名): 选中模型才显示,
-            // 与状态栏「复制模型名」对应
+            // 模型 ID(传给其他 agent 的模型名): 选中模型才显示,
+            // 与状态栏「选择模型ID」对应
             if dm.modelsTab == .list, let id = dm.selectedModel {
                 HStack(spacing: 8) {
-                    Text(app.ggufModelName(id: id))
+                    Text(id)
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
                     Button(T("复制")) { app.copyModelName(id: id) }
@@ -1735,6 +1763,7 @@ struct ModelsPage: View {
         }
         if let f = dm.forms[mode] { return f }
         let f = FormModel(mode: mode)
+        if case .edit(let id) = mode { f.isLoaded = { dm.loadedIDs.contains(id) } }
         dm.forms[mode] = f
         return f
     }
@@ -1767,11 +1796,21 @@ struct ModelsPage: View {
                 FormView(fm: f, dm: dm,
                          onSaved: {
                     app.modelsDidChange()
-                    app.appendLogLine("[dashboard] model config saved: \(id)")
+                    if let newID = f.renamedTo {
+                        // 保存 = 改名:旧表单作废,切到新模型
+                        f.renamedTo = nil
+                        dm.forms[.edit(id: id)] = nil
+                        dm.selectedModel = newID
+                        app.appendLogLine("[dashboard] model renamed: \(id) -> \(newID)")
+                        refreshEntries()
+                    } else {
+                        app.appendLogLine("[dashboard] model config saved: \(id)")
+                    }
                 },
                          onDelete: {
                     if let m = dm.modelEntries.first(where: { $0.id == id }) { deleteModel(m) }
                 },
+                         onDuplicate: { duplicateModel(id) },
                          header: AnyView(headerBar))
             } else {
                 VStack(spacing: 0) {
@@ -1784,6 +1823,31 @@ struct ModelsPage: View {
                 }
             }
         }
+    }
+
+    // 复制为新配置(2026-09):以磁盘上已保存的参数为底(未保存修改留在
+    // 原模型),新模型 ID 走与保存同一套验证;通过才建新文件并切过去
+    private func duplicateModel(_ id: String) {
+        let alert = NSAlert()
+        alert.messageText = T("复制为新配置")
+        alert.informativeText = T("输入自定义模型ID(留空 = GGUF 真名)")
+        alert.addButton(withTitle: T("保存"))
+        alert.addButton(withTitle: T("取消"))
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let r = resolveModelName(field.stringValue, ggufName: app.ggufModelName(id: id))
+        guard r.error == nil, let newID = r.id else {
+            infoAlert(T("保存失败"), r.error!)
+            return
+        }
+        let f = LlmFile.read(CONFIG_DIR + "/" + id + CONFIG_EXT)
+        try? f.text().write(toFile: CONFIG_DIR + "/" + newID + CONFIG_EXT, atomically: true, encoding: .utf8)
+        dm.forms[.edit(id: newID)] = nil
+        dm.selectedModel = newID
+        app.modelsDidChange()
+        app.appendLogLine("[dashboard] model duplicated: \(id) -> \(newID)")
+        refreshEntries()
     }
 
     private func deleteModel(_ m: ModelEntry) {

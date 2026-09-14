@@ -156,10 +156,10 @@ struct Settings {
 struct ModelEntry {
     let name: String   // filename in config/
     let path: String
-    // model id = filename without the .llm extension. The filename is
-    // always the GGUF's real name (migrateConfigFiles renames legacy
-    // files), so the id is stable and visible to external tools.
-    // The optional "# display-name:" comment is display-only.
+    // model id = filename without the .llm extension. 2026-09 naming
+    // ruling: the custom name IS the filename (and thus the id); an
+    // empty name falls back to the GGUF's real name. The legacy
+    // "# display-name:" comment is only read by the startup migration.
     var id: String { name.hasSuffix(CONFIG_EXT) ? String(name.dropLast(CONFIG_EXT.count)) : name }
     var displayName: String { LlmFile.read(path).displayName }
     var label: String { displayName.isEmpty ? id : displayName }
@@ -192,31 +192,57 @@ func buildPresetFile() {
     try? out.write(toFile: PRESET_FILE, atomically: true, encoding: .utf8)
 }
 
-// One-time migration: config files used to be named after the optional
-// custom name, which made the custom name the live router model id.
-// Now the id is always the GGUF's real name; the old name moves into a
-// "# display-name:" comment. Returns log messages (may be empty).
-func migrateConfigFiles() -> [String] {
+// Unified model-name validation (2026-09 naming ruling: name = filename
+// = model id). Returns (targetID, nil) or (nil, errorMessage). An empty
+// name falls back to the GGUF's real name — the designed default, not an
+// error. Shared by add / edit-save / duplicate.
+func resolveModelName(_ raw: String, ggufName: String, excludeID: String? = nil) -> (id: String?, error: String?) {
+    let name = raw.trimmingCharacters(in: .whitespaces)
+    let id: String
+    if name.isEmpty {
+        id = ggufName
+    } else {
+        guard !name.contains("/") else { return (nil, T("名称不能包含 /")) }
+        // trailing ".letters" = file extension (.gguf/.llm/.txt/...);
+        // "Qwen3.8"-style trailing digits stay allowed
+        guard name.range(of: #"\.[A-Za-z]+$"#, options: .regularExpression) == nil else {
+            return (nil, T("名称不能带文件扩展名"))
+        }
+        id = name
+    }
+    guard !id.isEmpty else { return (nil, T("模型路径必填")) }
+    if id != excludeID, FileManager.default.fileExists(atPath: CONFIG_DIR + "/" + id + CONFIG_EXT) {
+        return (nil, TF("名称已被占用: %@", id))
+    }
+    return (id, nil)
+}
+
+// Startup migration for the 2026-09 naming ruling: legacy files carry the
+// custom name in a "# display-name:" comment while the filename is the
+// GGUF's real name — move the alias into the filename. Runs at every
+// launch, idempotent (no-op once all files are migrated). Returns messages
+// (empty = nothing to do).
+func migrateAliasFiles() -> [String] {
     var msgs: [String] = []
     guard let names = try? FileManager.default.contentsOfDirectory(atPath: CONFIG_DIR) else { return msgs }
-    for name in names where name.hasSuffix(CONFIG_EXT) {
+    for name in names.sorted() where name.hasSuffix(CONFIG_EXT) {
         let id = String(name.dropLast(CONFIG_EXT.count))
         let path = CONFIG_DIR + "/" + name
         let f = LlmFile.read(path)
-        guard let modelPath = f.values["model"], !modelPath.isEmpty else { continue }
-        let gguf = URL(fileURLWithPath: modelPath).deletingPathExtension().lastPathComponent
-        if gguf.isEmpty || gguf == id { continue }
-        let target = CONFIG_DIR + "/" + gguf + CONFIG_EXT
-        guard !FileManager.default.fileExists(atPath: target) else {
-            msgs.append("config migration: \(name) -> \(gguf) skipped (target exists)")
+        guard !f.displayName.isEmpty, f.displayName != id else { continue }
+        let target = CONFIG_DIR + "/" + f.displayName + CONFIG_EXT
+        if FileManager.default.fileExists(atPath: target) {
+            msgs.append(TF("名称重复「%@」:当前版本自定义名称即模型 ID,不允许重复,%@ 未迁移,请手动处理", f.displayName, name))
             continue
         }
         var text = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-        if f.displayName.isEmpty { text += "# display-name: \(id)\n" }
+        text = text.components(separatedBy: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("# display-name:") }
+            .joined(separator: "\n")
         do {
             try text.write(toFile: target, atomically: true, encoding: .utf8)
             try FileManager.default.removeItem(atPath: path)
-            msgs.append("config migration: \(name) -> \(gguf) (display name kept)")
+            msgs.append(TF("%@ (原 %@)", f.displayName + CONFIG_EXT, name))
         } catch {
             msgs.append("config migration failed for \(name): \(error.localizedDescription)")
         }
@@ -743,9 +769,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         log.onLine = { [weak self] line in self?.appendRouterLine(line) }
         appLog = LogSink(file: APP_LOG_FILE)
 
-        // rename legacy config files (custom-name filenames) to the
-        // GGUF's real name before the first preset build
-        for msg in migrateConfigFiles() { appendLogLine("[menubar] " + msg) }
+        // 2026-09 naming ruling: custom name = filename = model id. Move
+        // legacy "# display-name:" aliases into the filename before the
+        // first preset build (idempotent; no-op once migrated)
+        let migrated = migrateAliasFiles()
+        for msg in migrated { appendLogLine("[menubar] " + msg) }
+        if !migrated.isEmpty {
+            let text = migrated.joined(separator: "\n")
+            DispatchQueue.main.async { [weak self] in
+                self?.showAlert(TF("已迁移 %d 个配置", migrated.count), text)
+            }
+        }
 
         // 激活到前台: app 常被 nohup/开机自启在后台拉起, 后台状态下
         // Dock 右键菜单的「退出」不响应 —— 启动即激活, Dock 菜单随时可用
@@ -899,7 +933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             act.target = self
             act.representedObject = m.id
             sub.addItem(act)
-            let copy = NSMenuItem(title: T("复制模型名"), action: #selector(copyModelNameItem(_:)), keyEquivalent: "")
+            let copy = NSMenuItem(title: T("选择模型ID"), action: #selector(copyModelNameItem(_:)), keyEquivalent: "")
             copy.target = self
             copy.representedObject = m.id
             sub.addItem(copy)
@@ -1548,8 +1582,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dashboard.show(page: .models, modelsTab: .list, editing: id)
     }
 
-    // GGUF 真名(传给其他 agent 用的模型名): 解析 .llm 里的 model 路径
-    // 取文件名去 .gguf —— 不依赖「自定义名称留空」的约定, 任何时候都正确
+    // GGUF 真名: 解析 .llm 里的 model 路径取文件名去 .gguf。2026-09 起
+    // API 名 = 模型 ID(自定义名), 这里只给「复制为新配置」的留空保底用
     // single .llm parser stays LlmFile (kapa P2-9); empty model value is
     // malformed (the form never writes it) and falls back to id
     func ggufModelName(id: String) -> String {
@@ -1558,10 +1592,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
     }
 
-    // 复制 GGUF 真名到剪贴板(状态栏子菜单和控制面板共用)
+    // 复制模型 ID 到剪贴板(状态栏子菜单和控制面板共用)。2026-09 起
+    // id = 自定义名(= 文件名),外部客户端就是拿它请求的;GGUF 真名
+    // 不再是 API 名
     func copyModelName(id: String) {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(ggufModelName(id: id), forType: .string)
+        NSPasteboard.general.setString(id, forType: .string)
     }
 
     @objc func copyModelNameItem(_ sender: NSMenuItem) {
