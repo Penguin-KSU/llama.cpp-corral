@@ -60,7 +60,7 @@ let PARAMS: [Param] = [
     P("keep", .num, "0", "从上下文开头保留的 token 数", 1),
     P("n-predict", .num, "-1 (无限)", "单次请求最多生成的 token 数", 1),
     P("swa-full", .bool, "off", "滑动窗口模型按全窗口计算(更费内存)", 1, oneWay: true),
-    P("kv-unified", .text, "auto (slots 为 auto 时启用)", "KV 缓存统一模式", 1),
+    P("kv-unified", .bool, "off", "所有序列共用一块 KV 缓存(slots 为 auto 时自动启用)", 1),
     P("kv-unified-per-slot", .num, "未设置", "KV 缓存统一模式(每 slot)", 1),
     P("ctx-checkpoints", .num, "32", "上下文检查点数量(供缓存复用)", 1),
     P("checkpoint-min-step", .num, "8192", "检查点之间的最小步长(token 数)", 1),
@@ -438,6 +438,7 @@ final class FormModel: ObservableObject {
     // 每次变更实时比较——改了又改回去,圆点立刻灭(事件式要手动保存
     // 才消)。模型路径/模型 ID 不进 baseline(填路径不亮点的旧语义)
     private var baseline: (values: [String: String], pinned: [String], manual: [String]) = ([:], [], [])
+    private var baselineGGUF = ""   // 模型路径也进 preset, 一并参与偏离比较
 
     // values 里空值 = 键不存在(setValue 写入 nil 即删键);防御性过滤
     // 解析自畸形文件的空串行
@@ -451,6 +452,13 @@ final class FormModel: ObservableObject {
         dirty = effectiveValues != baseline.values
             || pinned != baseline.pinned
             || manual != baseline.manual
+    }
+
+    // preset 内容是否偏离上次落盘: 值面 + 模型路径(两者都进 preset,
+    // router reload 时 preset 有变的运行中模型会被卸载)。图钉/手动区
+    // 顺序是注释行, 生成 preset 时被剥掉, 不算
+    var presetDirty: Bool {
+        effectiveValues != baseline.values || ggufPath != baselineGGUF
     }
     // 分组卡默认折叠, 用户按需展开
     @Published var openGroups: Set<Int> = []
@@ -490,6 +498,7 @@ final class FormModel: ObservableObject {
         }
         syncCustomKeys()
         baseline = (values: effectiveValues, pinned: pinned, manual: manual)
+        baselineGGUF = ggufPath
     }
 
     // 打开表单时把「值非空且不在选项列表里」的 allowCustom 参数还原进自定义
@@ -586,6 +595,7 @@ final class FormModel: ObservableObject {
             }
         }
         baseline = (values: effectiveValues, pinned: pinned, manual: manual)
+        baselineGGUF = ggufPath
         dirty = false
         return nil
     }
@@ -1595,6 +1605,10 @@ struct FormView: View {
     private var bottomBar: some View {
         HStack(spacing: 10) {
             Button(T("保存")) {
+                // 已加载 + preset 内容有变 → router reload 会卸载该模型, 先告知
+                if case .edit(let id) = fm.mode, fm.isLoaded(), fm.presetDirty {
+                    guard confirmAlert(T("保存"), TF("保存后 router 会卸载已加载的「%@」以应用新参数,确认继续吗?", id)) else { return }
+                }
                 if let err = fm.save() { infoAlert(T("保存失败"), err) }
                 else { fm.justSaved = true; onSaved() }
             }
@@ -1675,7 +1689,9 @@ struct ModelsPage: View {
                     Picker("", selection: modelSelection) {
                         Text(T("选择模型…")).tag(String?.none)
                         ForEach(dm.modelEntries, id: \.id) { m in
-                            Text(m.label + (dm.loadedIDs.contains(m.id) ? T(" · 已加载") : "")).tag(String?.some(m.id))
+                            Text(m.label
+                                + (dm.loadedIDs.contains(m.id) ? T(" · 已加载") : "")
+                                + (m.fileMissing ? T(" · ⚠️ 文件缺失") : "")).tag(String?.some(m.id))
                         }
                     }
                     .labelsHidden()

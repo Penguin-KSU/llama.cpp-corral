@@ -110,9 +110,13 @@ let enDict: [String: String] = [
     "router 反复崩溃": "router crash loop",
     "router 在 60 秒内多次退出，已停止自动重启。请查看 log 排查原因后重新打开本应用。": "The router exited repeatedly within 60 seconds, so auto-restart is disabled. Check the log, fix the cause, then relaunch this app.",
     "加载失败: %@": "Load failed: %@",
+    "模型文件不存在: %@": "Model file does not exist: %@",
+    "模型子进程启动后退出(exit code %d)。具体原因见 Router Log。": "The model process exited after starting up (exit code %d). See the Router Log for details.",
+    " · ⚠️ 文件缺失": " · ⚠️ file missing",
     "卸载失败: %@": "Unload failed: %@",
     "连接设置已保存,正在重启 router 生效": "Connection settings saved; restarting the router to apply",
     "%@。重启会卸载所有已加载的模型,确认继续吗?": "%@ Restarting unloads all loaded models. Continue?",
+    "保存后 router 会卸载已加载的「%@」以应用新参数,确认继续吗?": "Saving unloads the loaded \"%@\" via router reload to apply the new params. Continue?",
     "设置登录项失败: %@": "Failed to set the login item: %@",
 
     // ── models page / parameter form ──
@@ -348,7 +352,7 @@ let enDict: [String: String] = [
     "从上下文开头保留的 token 数": "Tokens kept from the start of the context",
     "单次请求最多生成的 token 数": "Max tokens generated per request",
     "滑动窗口模型按全窗口计算(更费内存)": "Full window for sliding-window models (more memory)",
-    "KV 缓存统一模式": "Unified KV cache mode",
+    "所有序列共用一块 KV 缓存(slots 为 auto 时自动启用)": "Single unified KV cache shared across all sequences (auto-enabled when slots is auto)",
     "KV 缓存统一模式(每 slot)": "Unified KV cache mode (per slot)",
     "上下文检查点数量(供缓存复用)": "Context checkpoints (for cache reuse)",
     "检查点之间的最小步长(token 数)": "Minimum step between checkpoints (tokens)",

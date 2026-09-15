@@ -163,6 +163,17 @@ struct ModelEntry {
     var id: String { name.hasSuffix(CONFIG_EXT) ? String(name.dropLast(CONFIG_EXT.count)) : name }
     var displayName: String { LlmFile.read(path).displayName }
     var label: String { displayName.isEmpty ? id : displayName }
+    // GGUF 路径:只认非空绝对路径 —— 手改文件的相对路径/缺失行不管
+    // (2026-09 定案:用户自己改出问题我们不管)
+    var ggufPath: String? {
+        let v = LlmFile.read(path).values["model"] ?? ""
+        return v.hasPrefix("/") ? v : nil
+    }
+    // 纯派生状态:每次开菜单/刷新现算,文件放回来标记自动消失,不持久化
+    var fileMissing: Bool {
+        guard let p = ggufPath else { return false }
+        return !FileManager.default.fileExists(atPath: p)
+    }
 }
 
 func loadModelEntries() -> [ModelEntry] {
@@ -553,7 +564,7 @@ final class RouterProc {
 
 // MARK: - Router HTTP API
 
-struct ModelInfo { let id: String; let status: String }
+struct ModelInfo { let id: String; let status: String; let failed: Bool; let exitCode: Int }
 
 func isRunningStatus(_ s: String) -> Bool {
     return s == "loaded" || s == "loading" || s == "sleeping"
@@ -617,8 +628,13 @@ final class RouterAPI {
               let arr = obj["data"] as? [[String: Any]] else { return nil }
         return arr.compactMap { m in
             guard let id = m["id"] as? String else { return nil }
-            let status = (m["status"] as? [String: Any])?["value"] as? String ?? "unknown"
-            return ModelInfo(id: id, status: status)
+            let st = m["status"] as? [String: Any]
+            // failed/exit_code: 模型子进程退出后 router 留下的唯一失败信号
+            // (load 是异步的,HTTP 恒 200)
+            return ModelInfo(id: id,
+                             status: st?["value"] as? String ?? "unknown",
+                             failed: st?["failed"] as? Bool ?? false,
+                             exitCode: st?["exit_code"] as? Int ?? 0)
         }
     }
 
@@ -712,6 +728,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var timer: Timer?
 
     var loadedNames = Set<String>()
+    // 点了加载还在途中的模型: /models/load 异步恒 200,失败只能靠轮询
+    // failed 标记发现(见 checkPendingLoads);router 停/重启时必须随
+    // loadedNames 一起清,防止对没点过的加载弹幽灵窗
+    var pendingLoads = Set<String>()
     var routerDead = false
     // true once a spawn succeeded; gates the health-check recovery so a
     // failed start (already handled by startRouter's alert) doesn't also
@@ -921,7 +941,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 每次开菜单都跑: 只列一遍目录, 循环和空判断共用(v2.0 检查 P2-14)
         let entries = loadModelEntries()
         for m in entries {
-            let item = NSMenuItem(title: m.label, action: nil, keyEquivalent: "")
+            let missing = m.fileMissing
+            let item = NSMenuItem(title: missing ? m.label + T(" · ⚠️ 文件缺失") : m.label, action: nil, keyEquivalent: "")
             item.state = loadedNames.contains(m.id) ? .on : .off
             let sub = NSMenu()
             let act: NSMenuItem
@@ -1171,6 +1192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         appendLogLine("[menubar] restarting router after upgrade")
         loadedNames = []
+        pendingLoads = []
         updateIcon()
         proc.stop()
         stopProxy()
@@ -1366,6 +1388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // latch 让 recoverRouter 提前返回, 它自己的清理到不了(审计 B7)
             routerUp = false
             loadedNames = []
+            pendingLoads = []
             updateIcon()
             proxyStartFailed = true
             let alert = NSAlert()
@@ -1398,6 +1421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         proxyStartFailed = false   // 用户显式重切 = 重试(审计 B7)
         appendLogLine("[proxy] audio transcoding \(on ? "enabled" : "disabled") — restarting router")
         loadedNames = []
+        pendingLoads = []
         updateIcon()
         proc.stop()
         stopProxy()
@@ -1446,8 +1470,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let list else { return }
                 self.loadedNames = Set(list.filter { isRunningStatus($0.status) }.map { $0.id })
                 self.dashboard.model.loadedIDs = self.loadedNames
+                self.dashboard.model.modelEntries = loadModelEntries()
                 self.dashboard.model.routerReady = healthy
                 self.updateIcon()
+                self.checkPendingLoads(list)
+            }
+        }
+    }
+
+    // 加载失败检测: router 的 load 异步(HTTP 恒 200),子进程死了只在
+    // /models 留 failed/exit_code —— 不消费这个信号,文件缺失/OOM/文件
+    // 损坏等失败全静默。搭 3s 刷新便车,无新轮询
+    func checkPendingLoads(_ list: [ModelInfo]) {
+        for id in pendingLoads {
+            guard let m = list.first(where: { $0.id == id }) else {
+                pendingLoads.remove(id)   // 配置被删 / preset 重载
+                continue
+            }
+            if m.failed {
+                pendingLoads.remove(id)
+                appendLogLine("[menubar] model load failed: \(id) (exit code \(m.exitCode))")
+                showAlert(TF("加载失败: %@", id),
+                    TF("模型子进程启动后退出(exit code %d)。具体原因见 Router Log。", m.exitCode))
+            } else if m.status != "loading" && m.status != "downloading" {
+                // loaded/sleeping = 成功;unloaded(无 failed) = 被手动卸载
+                pendingLoads.remove(id)
             }
         }
     }
@@ -1488,6 +1535,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.recovering = false
                 guard !self.routerDead else { return }
                 self.loadedNames = []
+                self.pendingLoads = []
                 self.updateIcon()
                 // crash-loop guard: 3 restarts within 60s => give up
                 let now = Date()
@@ -1554,12 +1602,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func loadModel(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
+        // 预检: 文件没了连请求都不发 —— router 的 load 异步恒 200,不在这
+        // 拦住就是完全静默。2026-09 定案: 加载项不置灰(NSMenu
+        // autoenablesItems 默认 true 会覆盖手动 isEnabled),点击弹带路径的
+        // 报错,信息量大于一个灰项
+        if let m = loadModelEntries().first(where: { $0.id == name }), m.fileMissing {
+            showAlert(TF("加载失败: %@", name), TF("模型文件不存在: %@", m.ggufPath ?? ""))
+            return
+        }
         DispatchQueue.global().async { [weak self] in
             guard let self else { return }
             let err = self.api.load(name)
             DispatchQueue.main.async {
                 if let err { self.showAlert(TF("加载失败: %@", name), err) }
-                else { self.appendLogLine("[menubar] loading model: \(name)"); self.refreshState() }
+                else {
+                    self.pendingLoads.insert(name)
+                    self.appendLogLine("[menubar] loading model: \(name)"); self.refreshState()
+                }
             }
         }
     }
