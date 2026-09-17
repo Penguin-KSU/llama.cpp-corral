@@ -140,7 +140,9 @@ let enDict: [String: String] = [
     "名称已被占用: %@": "Name already in use: %@",
     "模型正在加载,请先卸载再改名": "The model is loaded — unload it before renaming",
     "复制为新配置": "Duplicate as New Config",
-    "输入自定义模型ID(留空 = GGUF 真名)": "Enter the custom model ID (empty = GGUF file name)",
+    "参数将复制自当前模型。填写新模型 ID(必填),GGUF 路径可沿用当前值或更换。": "Parameters are copied from the current model. Enter the new model ID (required); the GGUF path can keep the current value or be changed.",
+    "GGUF 路径": "GGUF path",
+    "必填": "Required",
     "已迁移 %d 个配置": "Migrated %d config(s)",
     "将保存为 config/%@.llm": "Will be saved as config/%@.llm",
     "输入参数名…": "Type a parameter name…",
@@ -285,10 +287,11 @@ let enDict: [String: String] = [
 
     // ── sidebar / window ──
     "日志": "Logs",
-    "暂停滚动": "Pause scroll",
-    "查找历史": "View history",
-    "默认状态": "Reset to default",
-    "实时日志 + 自动滚动": "Live log + auto-scroll",
+    "全部 (实时)": "All (live)",
+    "Router (实时)": "Router (live)",
+    "App (实时)": "App (live)",
+    "Router · %@": "Router · %@",
+    "App · %@": "App · %@",
     "设置": "Settings",
     "Corral 控制面板": "Corral Dashboard",
 

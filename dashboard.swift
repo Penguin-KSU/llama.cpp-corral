@@ -349,19 +349,32 @@ struct LlmFile {
 
 // MARK: - Shared log store (replaces the old AppKit log window)
 
+// 单流带来源标签: router 行与 app 行进入同一条到达序,「全部」视图直接
+// 按序交错;seq 单调递增(被 2000 行上限丢弃的行也消耗序号),渲染层靠
+// seq 断档判断「缓冲丢过行 → 整段重建」
+enum LogSource { case router, app }
+
+struct LogLine {
+    let seq: Int
+    let source: LogSource
+    let text: String
+}
+
 final class LogStore: ObservableObject {
-    @Published private(set) var lines: [String] = []
-    func append(_ line: String) {
+    static let maxLines = 2000
+    @Published private(set) var lines: [LogLine] = []
+    private var seq = 0
+    func append(_ source: LogSource, _ line: String) {
         // @Published must mutate on the main thread; the audio proxy calls
         // in from its own queues (audit B11). Hop once; the cap logic and
         // ordering land on the main queue (FIFO), same as router lines.
         if !Thread.isMainThread {
-            DispatchQueue.main.async { self.append(line) }
+            DispatchQueue.main.async { self.append(source, line) }
             return
         }
-        lines.append(line)
-        // cap in-memory buffer (~200k chars, mirrors the old window)
-        if lines.count > 4000 { lines.removeFirst(lines.count - 4000) }
+        seq += 1
+        lines.append(LogLine(seq: seq, source: source, text: line))
+        if lines.count > Self.maxLines { lines.removeFirst(lines.count - Self.maxLines) }
     }
 }
 
@@ -1656,6 +1669,20 @@ private extension FormMode {
     var isEdit: Bool { if case .edit = self { return true }; return false }
 }
 
+// 复制为新配置弹窗的「浏览…」按钮 target:ModelsPage 是 SwiftUI struct,
+// 不能直接当 AppKit target,用这个小类跑文件选择器并回填路径框
+private final class DuplicateBrowseTarget: NSObject {
+    let field: NSTextField
+    init(field: NSTextField) { self.field = field }
+    @objc func browse() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url { field.stringValue = url.path }
+    }
+}
+
 // MARK: - Models page (全局参数 / 添加新模型 / 模型配置)
 
 struct ModelsPage: View {
@@ -1842,27 +1869,71 @@ struct ModelsPage: View {
     }
 
     // 复制为新配置(2026-09):以磁盘上已保存的参数为底(未保存修改留在
-    // 原模型),新模型 ID 走与保存同一套验证;通过才建新文件并切过去
+    // 原模型)。弹窗两行:新模型 ID(必填,留空 = 保存灰置)+ GGUF 路径
+    // (预填当前值,可改/可浏览)。2026-09 二轮:ID 不再留空回退 GGUF 真名,
+    // 路径可换 = 复制参数到新模型。通过校验才建新文件并切过去
     private func duplicateModel(_ id: String) {
         let alert = NSAlert()
         alert.messageText = T("复制为新配置")
-        alert.informativeText = T("输入自定义模型ID(留空 = GGUF 真名)")
+        alert.informativeText = T("参数将复制自当前模型。填写新模型 ID(必填),GGUF 路径可沿用当前值或更换。")
         alert.addButton(withTitle: T("保存"))
         alert.addButton(withTitle: T("取消"))
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        alert.accessoryView = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let r = resolveModelName(field.stringValue, ggufName: app.ggufModelName(id: id))
-        guard r.error == nil, let newID = r.id else {
-            infoAlert(T("保存失败"), r.error!)
-            return
+        let saveButton = alert.buttons[0]
+
+        let srcPath = LlmFile.read(CONFIG_DIR + "/" + id + CONFIG_EXT).values["model"] ?? ""
+        let labelW: CGFloat = 90, fieldW: CGFloat = 200, browseW: CGFloat = 60
+        let h: CGFloat = 24, gap: CGFloat = 8
+        let idLabel = NSTextField(labelWithString: T("自定义模型ID"))
+        idLabel.frame = NSRect(x: 0, y: h + gap, width: labelW, height: h)
+        let idField = NSTextField(string: "")
+        idField.frame = NSRect(x: labelW + gap, y: h + gap, width: fieldW, height: h)
+        let pathLabel = NSTextField(labelWithString: T("GGUF 路径"))
+        pathLabel.frame = NSRect(x: 0, y: 0, width: labelW, height: h)
+        let pathField = NSTextField(string: srcPath)
+        pathField.frame = NSRect(x: labelW + gap, y: 0, width: fieldW, height: h)
+        let browseTarget = DuplicateBrowseTarget(field: pathField)
+        let browseButton = NSButton(title: T("浏览…"), target: browseTarget, action: #selector(DuplicateBrowseTarget.browse))
+        browseButton.frame = NSRect(x: labelW + gap + fieldW + gap, y: 0, width: browseW, height: h)
+        let container = NSView(frame: NSRect(x: 0, y: 0,
+                                             width: labelW + gap + fieldW + gap + browseW, height: h * 2 + gap))
+        for v in [idLabel, idField, pathLabel, pathField, browseButton] as [NSView] { container.addSubview(v) }
+        alert.accessoryView = container
+
+        // ID 必填:留空 = 保存灰置(仅本弹窗,不改其他「留空 = 真名」语义)
+        saveButton.isEnabled = false
+        let obs = NotificationCenter.default.addObserver(forName: NSControl.textDidChangeNotification,
+                                                          object: idField, queue: .main) { _ in
+            saveButton.isEnabled = !idField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
         }
-        let f = LlmFile.read(CONFIG_DIR + "/" + id + CONFIG_EXT)
-        try? f.text().write(toFile: CONFIG_DIR + "/" + newID + CONFIG_EXT, atomically: true, encoding: .utf8)
-        dm.forms[.edit(id: newID)] = nil
-        dm.selectedModel = newID
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            NotificationCenter.default.removeObserver(obs); return
+        }
+        NotificationCenter.default.removeObserver(obs)
+
+        let newID = idField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !newID.isEmpty else { return }   // 灰置已挡,双保险
+        // 路径校验(与 save() 同口径):展开 ~ + 存在 + .gguf
+        let expanded = (pathField.stringValue as NSString).expandingTildeInPath
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir), !isDir.boolValue else {
+            infoAlert(T("保存失败"), T("找不到该路径的文件")); return
+        }
+        guard expanded.lowercased().hasSuffix(".gguf") else {
+            infoAlert(T("保存失败"), T("不是 .gguf 文件(llama.cpp 只支持 GGUF 格式)")); return
+        }
+        let gguf = URL(fileURLWithPath: expanded).deletingPathExtension().lastPathComponent
+        let r = resolveModelName(newID, ggufName: gguf)
+        guard r.error == nil, let targetID = r.id else {
+            infoAlert(T("保存失败"), r.error!); return
+        }
+        // 复制源 .llm,重写 model 行为新路径(沿用/换路径都覆盖 model 键)
+        var f = LlmFile.read(CONFIG_DIR + "/" + id + CONFIG_EXT)
+        f.values["model"] = expanded
+        try? f.text().write(toFile: CONFIG_DIR + "/" + targetID + CONFIG_EXT, atomically: true, encoding: .utf8)
+        dm.forms[.edit(id: targetID)] = nil
+        dm.selectedModel = targetID
         app.modelsDidChange()
-        app.appendLogLine("[dashboard] model duplicated: \(id) -> \(newID)")
+        app.appendLogLine("[dashboard] model duplicated: \(id) -> \(targetID)")
         refreshEntries()
     }
 
@@ -3093,197 +3164,262 @@ struct EnvPage: View {
 
 // MARK: - Logs page
 
-// Per-panel state. Lives in LogPageModel (AppDelegate-owned, like
-// envModel/settingsModel) so page switches don't drop it.
-final class LogPanelModel: ObservableObject {
-    @Published var paused = false            // 暂停滚动
-    @Published var historyMode = false       // 查找历史
-    @Published var days: [String] = []       // rotated days, newest first
-    @Published var day: String? = nil        // selected day (historyMode only)
+// 面板当前显示什么。实时三档从 logStore 流式渲染;历史项 = 某个轮转文件
+// 的只读快照。整个日志页只剩这一个状态 —— 旧的 paused/historyMode/day/
+// hint 四件套随「隐式钉底 + 单一 popup」定案退役(2026-09)。
+enum LogView: Hashable {
+    case all, router, app
+    case history(file: String, day: String)
+}
+
+// 页面状态。Lives in AppDelegate (lazy var logPageModel) so page switches
+// don't drop it (same pattern as envModel/settingsModel).
+final class LogPageModel: ObservableObject {
+    @Published var view: LogView = .all
+    @Published var routerDays: [String] = []   // rotated days, newest first
+    @Published var appDays: [String] = []
     @Published var historyLines: [String] = []
-    @Published var hint = false              // 「默认状态」点击提示, 2s 自灭
+    private var loadingKey = ""
 
-    func refreshDays(_ file: String) { days = logHistoryDays(forFile: file) }
-
-    func toggleHistory(_ file: String) {
-        refreshDays(file)
-        if historyMode {
-            historyMode = false
-            day = nil
-            historyLines = []
-            return
-        }
-        guard let d = days.first else { return }   // 还没有轮转文件
-        historyMode = true
-        selectDay(d, file: file)
+    func refreshDays() {
+        routerDays = logHistoryDays(forFile: LOG_FILE)
+        appDays = logHistoryDays(forFile: APP_LOG_FILE)
     }
 
-    func selectDay(_ d: String, file: String) {
-        day = d
-        historyLines = []   // 先清空再后台加载, 新日期下不先露前一天的内容
-        // 历史分片单个可达 50MB, 主线程读+切几十万行会冻住整个面板
+    func select(_ v: LogView) {
+        view = v
+        guard case .history(let file, let day) = v else {
+            historyLines = []
+            loadingKey = ""
+            return
+        }
+        let key = file + "/" + day
+        historyLines = []   // 先清空再后台加载, 新条目下不先露上一个的内容
+        loadingKey = key
+        // 历史分片单个可达 30MB, 主线程读+切几十万行会冻住整个面板
         // (v2.0 检查 P2-4); 挪后台, 快照语义不变(历史文件是只读快照)
         DispatchQueue.global().async {
-            let lines = logHistoryFile(forFile: file, day: d).map { logTailLines($0, n: 4000) } ?? []
+            let lines = logHistoryFile(forFile: file, day: day).map { logTailLines($0, n: 4000) } ?? []
             DispatchQueue.main.async {
-                // 快速连点多个日期: 迟到的旧响应丢弃, 只认当前选中的日期
-                guard self.day == d else { return }
+                // 快速连点多个条目: 迟到的旧响应丢弃, 只认当前选中的
+                guard self.loadingKey == key else { return }
                 self.historyLines = lines
             }
         }
     }
 
-    func openDayFile(_ file: String) {
-        guard let d = day, let p = logHistoryFile(forFile: file, day: d) else { return }
-        NSWorkspace.shared.open(URL(fileURLWithPath: p))
+    // 实时档开 logs/ 目录(两个活文件都在里面);历史档开所选文件
+    func openInFinder() {
+        if case .history(let file, let day) = view,
+           let p = logHistoryFile(forFile: file, day: day) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: p))
+        } else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: LOG_DIR))
+        }
     }
-
-    // 回默认: 今天的实时视图 + 自动滚动
-    func reset() {
-        historyMode = false
-        day = nil
-        historyLines = []
-        paused = false
-        hint = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.hint = false }
-    }
-}
-
-final class LogPageModel: ObservableObject {
-    let router = LogPanelModel()
-    let app = LogPanelModel()
 }
 
 struct LogsPage: View {
     let app: AppDelegate
-
-    var body: some View {
-        ScrollView {
-            VStack(spacing: 24) {
-                // 方案 B: 两面板卡片化, Router=蓝 / App=绿
-                LogPanel(m: app.logPageModel.router, store: app.routerLogStore,
-                         file: LOG_FILE, title: "Router Log", accent: UIStyle.hues[0])
-                LogPanel(m: app.logPageModel.app, store: app.appLogStore,
-                         file: APP_LOG_FILE, title: "App Log", accent: UIStyle.hues[3])
-            }
-            .padding(50)
-        }
-        .onAppear {
-            // 轮转文件只在跨天/超体积时新增, 打开页面刷新一次足够
-            app.logPageModel.router.refreshDays(LOG_FILE)
-            app.logPageModel.app.refreshDays(APP_LOG_FILE)
-        }
-    }
-}
-
-// 一个日志面板: 按钮行 + (历史模式下的日期行) + 400pt 日志区
-struct LogPanel: View {
-    @ObservedObject var m: LogPanelModel
+    @ObservedObject var model: LogPageModel
     @ObservedObject var store: LogStore
     @ObservedObject var l10n = L10n.shared   // re-render on language switch
-    let file: String
-    let title: String
-    let accent: Color   // 方案 B 顶部色条
+
+    init(app: AppDelegate) {
+        self.app = app
+        self.model = app.logPageModel
+        self.store = app.logStore
+    }
+
+    // 实时三档 = 按档过滤的单流;「全部」= 原始到达序交错
+    private var liveLines: [LogLine] {
+        switch model.view {
+        case .all:     return store.lines
+        case .router:  return store.lines.filter { $0.source == .router }
+        case .app:     return store.lines.filter { $0.source == .app }
+        case .history: return []
+        }
+    }
+
+    private var historyLines: [String]? {
+        if case .history = model.view { return model.historyLines }
+        return nil
+    }
+
+    // 渲染层靠 key 判断「换档 → 整段重建」(LogTextView 增量协议)
+    private var viewKey: String {
+        switch model.view {
+        case .all:    return "all"
+        case .router: return "router"
+        case .app:    return "app"
+        case .history(let file, let day): return "h:" + file + ":" + day
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text(title).font(.system(size: 13, weight: .semibold))
+                // 来源 + 历史同一个 popup (oMLX file-selector 形态): 选实时档
+                // 回实时, 选历史项进快照; 没有单独的「复位」按钮
+                Picker("", selection: Binding(
+                    get: { model.view },
+                    set: { model.select($0) })) {
+                    Text(T("全部 (实时)")).tag(LogView.all)
+                    Text(T("Router (实时)")).tag(LogView.router)
+                    Text(T("App (实时)")).tag(LogView.app)
+                    ForEach(model.routerDays, id: \.self) { d in
+                        Text(TF("Router · %@", d)).tag(LogView.history(file: LOG_FILE, day: d))
+                    }
+                    ForEach(model.appDays, id: \.self) { d in
+                        Text(TF("App · %@", d)).tag(LogView.history(file: APP_LOG_FILE, day: d))
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 240)
                 Spacer()
-                segButton(T("暂停滚动"), on: m.paused, disabled: m.historyMode) { m.paused.toggle() }
-                // 文件夹紧贴「查找历史」成一对: 历史模式下打开所选天最新分片
-                // 的全文(实时视图下置灰: 今天的文件还在写)
-                HStack(spacing: 2) {
-                    segButton(T("查找历史"), on: m.historyMode, disabled: m.days.isEmpty && !m.historyMode) { m.toggleHistory(file) }
-                    Button { m.openDayFile(file) } label: {
-                        Image(systemName: "folder")
-                            .font(.system(size: 13))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
-                            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.10)))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!m.historyMode || m.day == nil)
+                // 实时档开 logs/ 目录, 历史档开所选文件
+                Button { model.openInFinder() } label: {
+                    Image(systemName: "folder")
+                        .font(.system(size: 13))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.10)))
                 }
-                // 与历史单元拉开距离, 三个大按钮整体靠左一点点
-                segButton(T("默认状态"), on: false, disabled: !m.historyMode && !m.paused) { m.reset() }
-                    .padding(.leading, 24)
+                .buttonStyle(.plain)
             }
-            if m.historyMode {
-                HStack(spacing: 6) {
-                    ForEach(m.days, id: \.self) { d in
-                        Button { m.selectDay(d, file: file) } label: {
-                            Text(d)
-                                .font(.system(size: 12, design: .monospaced))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 3)
-                                .background(RoundedRectangle(cornerRadius: 5)
-                                    .fill(m.day == d ? Color.accentColor : Color.primary.opacity(0.10)))
-                                .foregroundStyle(m.day == d ? .white : .primary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            if m.hint {
-                Text(T("实时日志 + 自动滚动"))
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            }
-            content
-                .frame(height: 400)
+            LogTextView(key: viewKey,
+                        lines: liveLines,
+                        history: historyLines,
+                        colored: model.view == .all)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.03)))
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.15)))
         }
-        .padding(.vertical, 12)
-        .background(CardChrome(accent: accent).padding(.horizontal, -50))
+        .padding(50)
+        .onAppear {
+            // 轮转文件只在跨天/超体积时新增, 打开页面刷新一次足够
+            model.refreshDays()
+        }
+    }
+}
+
+// AppKit 日志区 (oMLX LogTextView 桥, 2026-09 定案): NSTextView 排版是
+// 增量/惰性的, 追加一行 O(新行) —— 旧 SwiftUI Text 每来一行全量重排整个
+// 缓冲是日志页卡顿的根因。增量协议: key 变(换档/进历史)或 seq 断档
+// (2000 行缓冲丢过旧行) → 整段重建; 否则只 append 新行。钉底跟随 (oMLX):
+// 更新前看用户是否钉在底部(40pt 容差), 是则带到底, 否则原地不动 ——
+// 往上滚 = 暂停, 回底 = 恢复, 无按钮。⌘F 查找栏白送。
+struct LogTextView: NSViewRepresentable {
+    let key: String
+    let lines: [LogLine]
+    let history: [String]?
+    let colored: Bool   // 「全部」档来源上色 (router 蓝 / app 绿)
+
+    final class Coordinator {
+        var viewKey = ""
+        var lastSeq = 0
     }
 
-    @ViewBuilder
-    private var content: some View {
-        if m.historyMode {
-            // 只读快照: 文件已封口, 无自动滚动
-            ScrollView {
-                Text(m.historyLines.joined(separator: "\n"))
-                    .font(.system(size: 11, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+        scroll.drawsBackground = false
+
+        guard let tv = scroll.documentView as? NSTextView else { return scroll }
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.isRichText = false
+        tv.allowsUndo = false
+        tv.usesFindBar = true
+        tv.isIncrementalSearchingEnabled = true
+        tv.drawsBackground = true
+        tv.backgroundColor = .clear
+        tv.textContainerInset = NSSize(width: 6, height: 8)
+        tv.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        // 日志行常宽于视图: 软换行到宽度, 无横滚条但长消息可读
+        if let c = tv.textContainer {
+            c.widthTracksTextView = true
+            c.lineFragmentPadding = 0
+        }
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let tv = scroll.documentView as? NSTextView,
+              let storage = tv.textStorage, let font = tv.font else { return }
+        let co = context.coordinator
+
+        // 钉底判定必须在改内容之前 (oMLX 40pt 容差)
+        let clip = scroll.contentView
+        let wasPinned = clip.documentRect.maxY - clip.documentVisibleRect.maxY < 40
+        var changed = false
+
+        if co.viewKey != key {
+            // 换档 / 进退出历史: 整段重建
+            storage.setAttributedString(history.map { Self.attr(plain: $0, font: font) }
+                                       ?? Self.attr(lines: lines, colored: colored, font: font))
+            co.viewKey = key
+            co.lastSeq = lines.last?.seq ?? 0
+            changed = true
+        } else if let hist = history {
+            // 历史快照: 空 → 加载完成一次性到达; 内容没变则不动
+            if tv.string != hist.joined(separator: "\n") {
+                storage.setAttributedString(Self.attr(plain: hist, font: font))
+                changed = true
             }
+        } else if lines.isEmpty {
+            if co.lastSeq != 0 {
+                storage.setAttributedString(NSAttributedString(string: ""))
+                co.lastSeq = 0
+            }
+        } else if lines[0].seq > co.lastSeq {
+            // seq 断档 = 缓冲丢过旧行, 增量前提不再成立 → 重建
+            storage.setAttributedString(Self.attr(lines: lines, colored: colored, font: font))
+            co.lastSeq = lines[lines.count - 1].seq
+            changed = true
         } else {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(store.lines.joined(separator: "\n"))
-                        .font(.system(size: 11, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .id("tail")
-                }
-                .onChange(of: store.lines.count) {
-                    if !m.paused { proxy.scrollTo("tail", anchor: .bottom) }
-                }
-                .onChange(of: m.paused) {
-                    // 取消暂停 = 回到实时尾部
-                    if !m.paused { proxy.scrollTo("tail", anchor: .bottom) }
-                }
+            let fresh = lines.drop { $0.seq <= co.lastSeq }
+            if !fresh.isEmpty {
+                storage.append(Self.attr(lines: Array(fresh), colored: colored, font: font))
+                co.lastSeq = lines[lines.count - 1].seq
+                changed = true
             }
+        }
+
+        if wasPinned && changed {
+            DispatchQueue.main.async { tv.scrollToEndOfDocument(nil) }
         }
     }
 
-    // 分段语义: 选中 = 实心蓝底白字, 未选中 = 朴素(与模型页顶栏同款)。
-    // 整体 1.2 倍(2026-09 用户定): 字号 15.6 / 内边距 14.4,4.8 / 圆角 7.2
-    private func segButton(_ label: String, on: Bool, disabled: Bool,
-                           action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(label)
-                .font(.system(size: 15.6))
-                .padding(.horizontal, 14.4)
-                .padding(.vertical, 4.8)
-                .background(RoundedRectangle(cornerRadius: 7.2)
-                    .fill(on ? Color.accentColor : Color.primary.opacity(0.10)))
-                .foregroundStyle(on ? .white : .primary)
+    private static func attr(lines: [LogLine], colored: Bool, font: NSFont) -> NSAttributedString {
+        let m = NSMutableAttributedString()
+        for l in lines {
+            let color: NSColor
+            if !colored { color = .labelColor }
+            else if l.source == .router { color = NSColor(UIStyle.hue1) }
+            else { color = NSColor(UIStyle.hue4) }
+            m.append(NSAttributedString(string: l.text + "\n",
+                                        attributes: [.font: font, .foregroundColor: color]))
         }
-        .buttonStyle(.plain)
-        .disabled(disabled)
+        return m
+    }
+
+    private static func attr(plain: [String], font: NSFont) -> NSAttributedString {
+        let m = NSMutableAttributedString()
+        for s in plain {
+            m.append(NSAttributedString(string: s + "\n",
+                                        attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
+        }
+        return m
     }
 }
 

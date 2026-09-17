@@ -281,9 +281,11 @@ final class LogSink {
 
     // Rotation policy (2026-09, mirrors oMLX's logging_config.py with
     // Corral's own numbers): roll at midnight AND when the live file hits
-    // 50MB (same-day size splits get .1/.2 suffixes); rotated files older
-    // than 5 days are pruned. Deliberately fixed, not a setting.
-    private static let maxLiveBytes = 50 * 1024 * 1024
+    // 30MB (same-day size splits get .1/.2 suffixes); rotated files older
+    // than 5 days are pruned; the whole logs/ dir is additionally capped
+    // at 150MB (pruneLogBudget, oldest rotated files deleted first, live
+    // files never touched). Deliberately fixed, not a setting.
+    private static let maxLiveBytes = 30 * 1024 * 1024
     private static let retentionDays = 5
 
     init(file: String) {
@@ -381,6 +383,43 @@ final class LogSink {
                 try? FileManager.default.removeItem(atPath: dir + "/" + e)
             }
         }
+        // both sinks share logs/ and both call pruneRotated (launch + every
+        // rotation) — the budget pass is idempotent, so running it from
+        // either queue is safe
+        pruneLogBudget()
+    }
+}
+
+// Total disk budget for logs/ (2026-09): a pathological day (crash loop +
+// verbose router output) must not eat the disk. When the whole directory
+// exceeds the budget, rotated files are deleted oldest-first until it fits
+// again — newest content (and both live files) always survives, which is
+// the half that diagnoses the current state.
+private let logBudgetBytes = 150 * 1024 * 1024
+
+func pruneLogBudget() {
+    let fm = FileManager.default
+    guard let entries = try? fm.contentsOfDirectory(atPath: LOG_DIR) else { return }
+    let routerPrefix = (LOG_FILE as NSString).lastPathComponent + "."
+    let appPrefix = (APP_LOG_FILE as NSString).lastPathComponent + "."
+    var total = 0
+    var rotated: [(name: String, date: Date, part: Int, size: Int)] = []
+    for e in entries {
+        let size = ((try? fm.attributesOfItem(atPath: LOG_DIR + "/" + e))?[.size] as? Int) ?? 0
+        total += size
+        let rest: Substring
+        if e.hasPrefix(routerPrefix) { rest = e.dropFirst(routerPrefix.count) }
+        else if e.hasPrefix(appPrefix) { rest = e.dropFirst(appPrefix.count) }
+        else { continue }   // live files and anything unknown: never delete
+        let comps = rest.split(separator: ".").map(String.init)
+        guard let d = logDateFmt.date(from: comps.first ?? "") else { continue }
+        let part = comps.count > 1 ? (Int(comps[1]) ?? 0) : 0
+        rotated.append((e, d, part, size))
+    }
+    guard total > logBudgetBytes else { return }
+    for f in rotated.sorted(by: { ($0.date, $0.part) < ($1.date, $1.part) }) where total > logBudgetBytes {
+        try? fm.removeItem(atPath: LOG_DIR + "/" + f.name)
+        total -= f.size
     }
 }
 
@@ -421,7 +460,7 @@ func logHistoryFile(forFile file: String, day: String) -> String? {
 }
 
 // Tail `n` lines of a file (history view is a snapshot; a day's file is
-// capped at ~50MB per split, so a full read is bounded).
+// capped at ~30MB per split, so a full read is bounded).
 func logTailLines(_ path: String, n: Int) -> [String] {
     guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
     return Array(s.components(separatedBy: "\n").suffix(n))
@@ -768,10 +807,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var proxy: AudioProxy?
     var routerInternalPort = 0
     let dashboard = DashboardApp()
-    // 两个店对应落盘的两份文件: router 本体输出 / app 自己的行为
-    let routerLogStore = LogStore()
-    let appLogStore = LogStore()
-    // 日志页面板状态(暂停滚动/历史模式/选中日期): 挂 app 主体, 切页不销毁
+    // 日志单流(带来源标签; 落盘仍是两份文件: router 本体输出 / app 自己的行为)
+    let logStore = LogStore()
+    // 日志页状态(当前选中档 + 历史快照): 挂 app 主体, 切页不销毁
     lazy var logPageModel = LogPageModel()
     let upgradeRunner = UpgradeRunner()
     // 页面状态记录本: 挂在 app 主体上, 切页不销毁(曾在页面视图的
@@ -1641,16 +1679,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         dashboard.show(page: .models, modelsTab: .list, editing: id)
     }
 
-    // GGUF 真名: 解析 .llm 里的 model 路径取文件名去 .gguf。2026-09 起
-    // API 名 = 模型 ID(自定义名), 这里只给「复制为新配置」的留空保底用
-    // single .llm parser stays LlmFile (kapa P2-9); empty model value is
-    // malformed (the form never writes it) and falls back to id
-    func ggufModelName(id: String) -> String {
-        let path = LlmFile.read(CONFIG_DIR + "/\(id)\(CONFIG_EXT)").values["model"]
-        guard let path, !path.isEmpty else { return id }
-        return URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
-    }
-
     // 复制模型 ID 到剪贴板(状态栏子菜单和控制面板共用)。2026-09 起
     // id = 自定义名(= 文件名),外部客户端就是拿它请求的;GGUF 真名
     // 不再是 API 名
@@ -1801,7 +1829,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // router 本体输出行: 只进 UI 的 router 店; 落盘由 LogSink 直接写
     // router.log, 不能再经 appendLogLine(会把 router 输出双写进 app.log)
     func appendRouterLine(_ line: String) {
-        routerLogStore.append("[\(Self.logTimestamp.string(from: Date()))] \(line)")
+        logStore.append(.router, "[\(Self.logTimestamp.string(from: Date()))] \(line)")
     }
 
     // app 自己的行为(menubar/proxy/dashboard): UI + app.log 双写。
@@ -1809,7 +1837,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 与 router.log 分文件, router.log 保持 router 本体的纯净输出
     func appendLogLine(_ line: String) {
         let stamped = "[\(Self.logTimestamp.string(from: Date()))] \(line)"
-        appLogStore.append(stamped)
+        logStore.append(.app, stamped)
         appLog.append(Data((stamped + "\n").utf8))
     }
 
