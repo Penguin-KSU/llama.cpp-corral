@@ -818,6 +818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     lazy var envModel = EnvPageModel(app: self)
     lazy var settingsModel = SettingsFormModel(app: self)
     let selfUpdateRunner = UpgradeRunner()   // 设置页 Corral 自更新专用, 与 upgradeRunner 互不干扰
+    let forkRunner = UpgradeRunner()         // 接入 tab「从 URL 安装 fork」专用, 与上面两者互不干扰
 
     func applicationDidFinishLaunching(_ note: Notification) {
         Settings.firstRunSetup()
@@ -1155,6 +1156,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.save()
     }
 
+    // 已录用列表行尾 ✎ 改名: 按路径更新记录; 无记录(当前目录从未录入)则
+    // 新建 —— 列表按路径去重, 不会多出行
+    func renameSourceEntry(path: String, name: String) {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        if let i = settings.sources.firstIndex(where: { $0.path == path }) {
+            settings.sources[i].name = n
+        } else {
+            settings.sources.append(SourceEntry(path: path, name: n))
+        }
+        settings.save()
+    }
+
+    // 「从 URL 安装 fork」成功后: 只把目录记入已录用列表 —— 不切 src/bin、
+    // 不重启 router(接入时机用户自主选, 2026-09 定案); 按路径去重
+    func recordForkEntry(_ dir: String) {
+        if !settings.sources.contains(where: { $0.path == dir }) {
+            settings.sources.append(SourceEntry(path: dir, name: ""))
+        }
+        settings.save()
+    }
+
     // 源码编译版 vs 其他编译版: the identity follows the directory, not the
     // button — only the path recorded by the 源码编译 install flow (sticky,
     // survives delete + re-adopt) may show as 源码编译版; every other checkout
@@ -1191,6 +1213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func gitHead(_ src: String) -> String {
         gitRun(["-C", src, "rev-parse", "HEAD"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // 「从 URL 安装 fork」的目录三分支判定要拿现有仓库的 origin 地址;
+    // 无 origin(纯本地 init)返回空串, 按「别的仓库」分支处理
+    func gitRemoteUrl(_ src: String) -> String {
+        gitRun(["-C", src, "remote", "get-url", "origin"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

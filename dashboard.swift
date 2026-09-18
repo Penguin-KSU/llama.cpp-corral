@@ -13,6 +13,9 @@ import ServiceManagement
 // Values are written into .llm files verbatim, so defaults below are the
 // llama.cpp official defaults (checked against `llama-server --help`).
 // Empty field = not written to the file = llama.cpp uses its own default.
+// Choice lists deliberately omit the default value: the placeholder row
+// (tag "") already means "leave it to llama.cpp"; listing the default again
+// would be a duplicate option (2026-09).
 enum ParamKind {
     case text
     case path
@@ -49,7 +52,7 @@ private func P(_ key: String, _ kind: ParamKind, _ def: String, _ hint: String, 
     Param(key: key, kind: kind, def: def, hint: hint, group: group, oneWay: oneWay, allowCustom: allowCustom)
 }
 
-private let KV_TYPES: [String] = ["f16", "f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
+private let KV_TYPES: [String] = ["f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"]
 
 let PARAMS: [Param] = [
     // ---- group 1: context & cache ----
@@ -73,7 +76,7 @@ let PARAMS: [Param] = [
     P("slot-save-path", .path, "disabled", "slot 状态保存目录", 1),
     P("sleep-idle-seconds", .num, "-1 (disabled)", "空闲 N 秒后休眠释放内存", 1),
     P("warmup", .bool, "on", "启动时跑一次预热计算", 1),
-    P("rope-scaling", .choice(["none", "linear", "yarn"]), "linear (模型默认)", "RoPE 上下文扩展方式", 1),
+    P("rope-scaling", .choice(["none", "yarn"]), "linear", "RoPE 上下文扩展方式", 1),
     P("rope-scale", .num, "模型默认", "RoPE 缩放因子", 1),
     P("rope-freq-base", .num, "模型默认", "RoPE 频率基值", 1),
     P("rope-freq-scale", .num, "模型默认", "RoPE 频率缩放", 1),
@@ -84,10 +87,10 @@ let PARAMS: [Param] = [
     P("yarn-beta-fast", .num, "-1.00", "YaRN 插值参数 beta fast", 1),
     P("cache-type-k", .choice(KV_TYPES), "f16", "K 缓存的存储数据类型", 1),
     P("cache-type-v", .choice(KV_TYPES), "f16", "V 缓存的存储数据类型", 1),
-    P("flash-attn", .choice(["auto", "on", "off"]), "auto", "Flash Attention(省内存加速)", 1),
+    P("flash-attn", .choice(["on", "off"]), "auto", "Flash Attention(省内存加速)", 1),
     // ---- group 2: gpu & device ----
     P("n-gpu-layers", .text, "auto (数字 / auto / all)", "卸载到 GPU 的层数", 2),
-    P("split-mode", .choice(["none", "layer", "row", "tensor"]), "layer", "多 GPU 分层方式", 2),
+    P("split-mode", .choice(["none", "row", "tensor"]), "layer", "多 GPU 分层方式", 2),
     P("tensor-split", .text, "默认", "多 GPU 算力分配比例", 2),
     P("main-gpu", .num, "0", "主 GPU 索引", 2),
     P("device", .text, "默认", "计算设备指定", 2),
@@ -103,11 +106,11 @@ let PARAMS: [Param] = [
     P("cpu-strict-batch", .num, "同 cpu-strict", "预填充的 CPU 亲和严格程度", 2),
     P("prio-batch", .num, "0", "预填充的 CPU 进程优先级", 2),
     P("poll-batch", .num, "同 poll", "预填充的 CPU 轮询级别", 2),
-    P("fit", .choice(["on", "off"]), "on", "自动计算放得下的 GPU 层数", 2),
+    P("fit", .choice(["off"]), "on", "自动计算放得下的 GPU 层数", 2),
     P("fit-target", .text, "1024", "自动适配时预留的目标内存(MB)", 2),
     P("fit-ctx", .num, "4096", "自动适配估算用的上下文长度", 2),
-    P("load-mode", .choice(["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"]), "auto", "模型文件加载方式", 2),
-    P("lazy-mode", .choice(["on", "auto", "off"]), "auto", "计算图懒加载模式", 2),
+    P("load-mode", .choice(["none", "mmap", "mlock", "mmap+mlock", "dio"]), "auto", "模型文件加载方式", 2),
+    P("lazy-mode", .choice(["on", "off"]), "auto", "计算图懒加载模式", 2),
     P("kv-offload", .bool, "on", "KV 缓存卸载到 GPU", 2),
     P("repack", .bool, "on", "重排模型数据提升访问效率", 2),
     P("no-host", .bool, "off", "完全不用 CPU 参与计算", 2, oneWay: true),
@@ -146,7 +149,7 @@ let PARAMS: [Param] = [
     P("adaptive-decay", .num, "0.90", "自适应温度衰减率", 3),
     P("dynatemp-range", .num, "0.00", "动态温度波动范围(0 = 关闭)", 3),
     P("dynatemp-exp", .num, "1.00", "动态温度指数", 3),
-    P("mirostat", .choice(["0", "1", "2"]), "0 (disabled)", "Mirostat 动态困惑度控制(0 = 关闭)", 3),
+    P("mirostat", .choice(["1", "2"]), "0", "Mirostat 动态困惑度控制(0 = 关闭)", 3),
     P("mirostat-lr", .num, "0.10", "Mirostat 学习率", 3),
     P("mirostat-ent", .num, "5.00", "Mirostat 目标熵", 3),
     P("seed", .num, "-1 (随机)", "随机种子(-1 = 每次随机)", 3),
@@ -164,9 +167,9 @@ let PARAMS: [Param] = [
     P("chat-template", .text, "模型自带", "自定义对话模板", 4),
     P("chat-template-file", .path, "模型自带", "自定义对话模板文件", 4),
     P("chat-template-kwargs", .text, "JSON 对象字符串", "对话模板的额外参数", 4),
-    P("reasoning", .choice(["auto", "on", "off"]), "auto", "推理模式(DeepSeek-R1 等推理模型)", 4),
-    P("reasoning-format", .choice(["auto", "none", "deepseek", "deepseek-legacy"]), "auto", "推理输出格式", 4),
-    P("reasoning-effort", .choice(["default", "minimal", "low", "medium", "high", "xhigh", "max"]), "default", "推理 effort 等级", 4, allowCustom: true),
+    P("reasoning", .choice(["on", "off"]), "auto", "推理模式(DeepSeek-R1 等推理模型)", 4),
+    P("reasoning-format", .choice(["none", "deepseek", "deepseek-legacy"]), "auto", "推理输出格式", 4),
+    P("reasoning-effort", .choice(["minimal", "low", "medium", "high", "xhigh", "max"]), "default", "推理 effort 等级", 4, allowCustom: true),
     P("reasoning-budget", .num, "-1 (不限)", "推理 token 数上限", 4),
     P("reasoning-budget-message", .text, "无", "推理超预算时的提示消息", 4),
     P("reasoning-preserve", .bool, "on", "历史消息中保留推理内容", 4),
@@ -253,7 +256,7 @@ let PARAMS: [Param] = [
     P("spec-ngram-map-k4v-min-hits", .num, "1", "ngram-map-k4v 最小命中次数", 5),
     P("log-verbosity", .num, "3", "日志详细级别(0-4)", 5),
     P("verbose", .bool, "off", "详细日志输出", 5, oneWay: true),
-    P("log-colors", .choice(["on", "off", "auto"]), "auto", "日志彩色输出", 5),
+    P("log-colors", .choice(["on", "off"]), "auto", "日志彩色输出", 5),
     P("log-prefix", .bool, "off", "日志行前缀", 5),
     P("log-timestamps", .bool, "off", "日志时间戳", 5),
     P("log-file", .path, "", "日志输出文件", 5),
@@ -1972,8 +1975,11 @@ final class GroupRunner {
     // set by whichever reaps first (EOF handler or killTree()); exit code,
     // -1 if the process died by signal or was never reaped
     private var exitStatus: Int32? = nil
-    // both callbacks are delivered on the main queue
-    var onLine: ((String) -> Void)?
+    // both callbacks are delivered on the main queue.
+    // committed = 该行以 \n 收尾(定行); \r 收尾的是进度临时行(同一逻辑行
+    // 内刷新, 如 git clone/pull 的 Receiving objects)—— 调用方用它做
+    // 「替换最后一行」而不是追加(终端语义); 进程退出时的残余冲刷按定行
+    var onLine: ((String, Bool) -> Void)?
     var onExit: ((Int32) -> Void)?
 
     private static func codeOf(_ status: Int32) -> Int32 {
@@ -2025,9 +2031,16 @@ final class GroupRunner {
                     self.exitStatus = Self.codeOf(status)
                 }
                 if !self.pending.isEmpty {
-                    let rest = String(data: self.pending, encoding: .utf8) ?? ""
+                    var rest = self.pending
+                    // 被扣住的尾部 \r 随进程退出定稿: 剥掉分隔符本身;
+                    // 剥完为空(残余只是一个 \r)就不发 —— 注意不能 return,
+                    // 后面的 closeFile/onExit 派发必须照跑
+                    if rest.last == 0x0D { rest.removeLast() }
                     self.pending = Data()
-                    DispatchQueue.main.async { self.onLine?(rest) }
+                    if !rest.isEmpty {
+                        let line = String(data: rest, encoding: .utf8) ?? ""
+                        DispatchQueue.main.async { self.onLine?(line, true) }
+                    }
                 }
                 handle.closeFile()
                 self.readHandle = nil
@@ -2037,10 +2050,30 @@ final class GroupRunner {
                 return
             }
             self.pending.append(data)
-            while let idx = self.pending.firstIndex(of: 0x0A) {
-                let line = String(data: self.pending.subdata(in: 0..<idx), encoding: .utf8)
-                self.pending.removeSubrange(0..<idx + 1)
-                if let line { DispatchQueue.main.async { self.onLine?(line) } }
+            // \n 和 \r 都是行界: \n = 定行, \r = 进度临时行; \r\n 按一个
+            // \n 处理(Windows 行尾不产生空临时行)。旧实现只认 \n —— git 的
+            // 30 分钟 \r 进度全憋在缓冲里, 最后作为一行几 MB 的拼接垃圾涌出
+            while true {
+                let la = self.pending.firstIndex(of: 0x0A)
+                let lb = self.pending.firstIndex(of: 0x0D)
+                let idx: Int?
+                let committed: Bool
+                if let a = la, let b = lb {
+                    idx = min(a, b)
+                    // \n 在前 = 定行; \r 紧跟 \n(CRLF)也算定行; 其余是临时行
+                    committed = a < b || a == b + 1
+                } else if la == nil { idx = lb; committed = false }
+                else { idx = la; committed = true }
+                guard let i = idx else { break }
+                // 悬在缓冲末尾的 \r 先扣住不发: 下一 chunk 可能以 \n 开头
+                // (跨 chunk 的 CRLF), 发了就判不了性质; 新数据到达会重入本循环
+                if !committed, i == self.pending.count - 1 { break }
+                let line = String(data: self.pending.subdata(in: 0..<i), encoding: .utf8)
+                var end = i + 1
+                // 停在 \r 且紧跟 \n(CRLF) → 两个字节一起消费, 不留下空行
+                if self.pending[i] == 0x0D, i + 1 < self.pending.count, self.pending[i + 1] == 0x0A { end += 1 }
+                self.pending.removeSubrange(0..<end)
+                if let line { DispatchQueue.main.async { self.onLine?(line, committed) } }
             }
         }
         return nil
@@ -2099,6 +2132,9 @@ final class UpgradeRunner: ObservableObject {
     private var runner: GroupRunner?
     // set by cancel(): the finished line then says 已取消 instead of 失败
     private var cancelled = false
+    // 最后一行是不是 \r 进度临时行: 是 → 新临时行替换它(终端语义, git 的
+    // clone/pull 进度每秒刷几次, 追加会变成几千行近似重复); 定行到达即定格
+    private var liveProvisional = false
 
     // runs a command via a login shell (PATH: homebrew cmake) in its own
     // process group, so cancel() can kill the whole tree
@@ -2106,7 +2142,16 @@ final class UpgradeRunner: ObservableObject {
         let r = GroupRunner()
         runner = r
         cancelled = false
-        r.onLine = { [weak self] line in self?.lines.append(line) }
+        liveProvisional = false
+        r.onLine = { [weak self] line, committed in
+            guard let self else { return }
+            if !committed, self.liveProvisional, !self.lines.isEmpty {
+                self.lines[self.lines.count - 1] = line
+            } else {
+                self.lines.append(line)
+            }
+            self.liveProvisional = !committed
+        }
         r.onExit = { [weak self] code in
             self?.runner = nil
             done(code == 0)
@@ -2149,7 +2194,10 @@ final class UpgradeRunner: ObservableObject {
         var steps: [(String, String)] = []
         if pull {
             if hasUpstream {
-                steps.append(("$ git -C \(src) pull", "git -C \"\(src)\" pull"))
+                // --progress: git 的进度行默认只在 stderr 是 TTY 时打印,
+                // 流水线里走管道 = 全程静默; 强制开启后 \r 进度交给
+                // GroupRunner/UpgradeRunner 的临时行替换渲染(2026-09)
+                steps.append(("$ git -C \(src) pull --progress", "git -C \"\(src)\" pull --progress"))
             } else {
                 note(T("当前分支无上游,跳过 pull 直接编译"))
             }
@@ -2172,7 +2220,7 @@ final class UpgradeRunner: ObservableObject {
         finished = nil
         lines = []
         pipeline([
-            ("$ git -C \(repo) pull", "git -C \"\(repo)\" pull"),
+            ("$ git -C \(repo) pull --progress", "git -C \"\(repo)\" pull --progress"),
             ("$ ./build.sh", "cd \"\(repo)\" && ./build.sh"),
         ]) { ok in
             self.running = false
@@ -2214,10 +2262,10 @@ final class UpgradeRunner: ObservableObject {
         finished = nil
         lines = []
         let steps: [(String, String)] = [
-            (exists ? "$ git -C \(dir) pull"
-                    : "$ git clone https://github.com/ggml-org/llama.cpp \(dir)",
-             exists ? "git -C \"\(dir)\" pull"
-                    : "git clone https://github.com/ggml-org/llama.cpp \"\(dir)\""),
+            (exists ? "$ git -C \(dir) pull --progress"
+                    : "$ git clone --progress https://github.com/ggml-org/llama.cpp \(dir)",
+             exists ? "git -C \"\(dir)\" pull --progress"
+                    : "git clone --progress https://github.com/ggml-org/llama.cpp \"\(dir)\""),
             ("$ cmake -S \(dir) -B \(dir)/build -DCMAKE_BUILD_TYPE=Release",
              "cmake -S \"\(dir)\" -B \"\(dir)/build\" -DCMAKE_BUILD_TYPE=Release"),
             ("$ cmake --build \(dir)/build -j 8",
@@ -2228,6 +2276,56 @@ final class UpgradeRunner: ObservableObject {
             PipelineState.shared.busy = false
             self.finishedOK = ok
             self.finished = ok ? T("源码版安装完成") : (self.cancelled ? T("已取消") : T("源码版安装失败,查看上方输出"))
+            done(ok)
+        }
+    }
+
+    // 从 URL 安装第三方 fork(接入 tab 卡片) + 与 installSource 同款 cmake 两步。
+    // 不碰 src/bin —— 记入已录用列表和弹窗都由调用方在 done(ok) 里做(接入时机用户自选)。
+    // syncMode 三态(2026-09 修订: 「跳过 clone」只指不重下目录, 代码同步永远做,
+    // pull 本身就是「是否一致」的检测器 —— 一致时 no-op):
+    //   .clone  目录不存在 → git clone
+    //   .repair 同仓库但工作树空(clone 中断的半成品) → fetch 补完 + checkout 铺树
+    //   .sync   同仓库且树完整(最新/过期/都可能有) → pull --ff-only 对齐远端
+    //           (脏工作区/分叉 = 干净失败不覆盖, 与升级 tab 纪律一致)
+    enum ForkSyncMode { case clone, repair, sync }
+    func installFork(url: String, dir: String, sync: ForkSyncMode, done: @escaping (Bool) -> Void) {
+        guard !running, !PipelineState.shared.busy else { return }
+        _ = try? FileManager.default.createDirectory(
+            atPath: (dir as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true)   // git clone 只建叶子目录, 嵌套默认值要父目录在
+        running = true
+        PipelineState.shared.busy = true
+        finished = nil
+        lines = []
+        switch sync {
+        case .clone:
+            break
+        case .repair:
+            note(T("检测到半成品目录(clone 中断?),先补完下载并恢复工作树"))
+        case .sync:
+            note(T("目录已存在且是同一仓库,先与远端对齐再编译"))
+        }
+        var steps: [(String, String)] = []
+        switch sync {
+        case .clone:
+            steps.append(("$ git clone --progress \(url) \(dir)", "git clone --progress \"\(url)\" \"\(dir)\""))
+        case .repair:
+            steps.append(("$ git -C \(dir) fetch --progress origin", "git -C \"\(dir)\" fetch --progress origin"))
+            steps.append(("$ git -C \(dir) checkout -f", "git -C \"\(dir)\" checkout -f"))
+        case .sync:
+            steps.append(("$ git -C \(dir) pull --ff-only --progress", "git -C \"\(dir)\" pull --ff-only --progress"))
+        }
+        steps.append(("$ cmake -S \(dir) -B \(dir)/build -DCMAKE_BUILD_TYPE=Release",
+                      "cmake -S \"\(dir)\" -B \"\(dir)/build\" -DCMAKE_BUILD_TYPE=Release"))
+        steps.append(("$ cmake --build \(dir)/build -j 8",
+                      "cmake --build \"\(dir)/build\" -j 8"))
+        pipeline(steps) { ok in
+            self.running = false
+            PipelineState.shared.busy = false
+            self.finishedOK = ok
+            self.finished = ok ? T("fork 编译完成")
+                               : (self.cancelled ? T("已取消") : T("fork 编译失败,查看上方输出"))
             done(ok)
         }
     }
@@ -2266,7 +2364,24 @@ final class EnvPageModel: ObservableObject {
     @Published var branchDiff: [String: (ahead: Int, behind: Int)] = [:]
     @Published var branchSearch = ""
     @Published var adoptDirPath = ""
-    @Published var adoptName = ""
+    // 「从 URL 安装 fork」卡片草稿(与 adoptDirPath 同约定: 切页存活, 不随 refresh 重置)
+    @Published var forkUrl = ""
+    @Published var forkDir = ""
+    @Published var forkNote = ""            // 目录三分支判定的报错行(红)
+    @Published var forkMissingTools: [String] = []
+    // 目录框自动跟随哨兵: 记录上次写入的推导值。目录框为空或仍等于哨兵
+    // = 用户没动过 → URL 变化时继续覆盖; 用户改过(≠哨兵) → 永久停跟,
+    // 清空 = 恢复跟随(2026-09 定案 A: 默认值必须是可编辑的真值, 非占位符)
+    private var forkDirAuto = ""
+
+    // URL 变化时调用(视图 .onChange): 推导值落进目录框(黑字可编辑)
+    func forkUrlChanged() {
+        let derived = Self.defaultForkDir(url: forkUrl)
+        if forkDir.isEmpty || forkDir == forkDirAuto {
+            forkDir = derived
+            forkDirAuto = derived
+        }
+    }
     @Published var updateLine = ""     // 更新检查状态行
     @Published var hasUpdate = false
     // 状态派生(非动作派生): built != head 就亮, 终端 checkout 也能感知
@@ -2297,7 +2412,7 @@ final class EnvPageModel: ObservableObject {
         hasUpdate = false
         needsRebuild = false
         currentBehindUpstream = nil
-        // 只重置"打开即查"的自动查询; 用户输入(tab/adoptDirPath/adoptName/
+        // 只重置"打开即查"的自动查询; 用户输入(tab/adoptDirPath/
         // branchSearch)、事件记录(branchNotes/adoptNotes, append-only, 只随
         // app 重置, 2026-09-10 定案)、流水线便签(pipelineOrigin)和分支列表
         // (手动查询结果, 按钮保持「刷新」, 用户点刷新才重新 fetch, 2026-09
@@ -2511,6 +2626,95 @@ final class EnvPageModel: ObservableObject {
         }
     }
 
+    // 「从 URL 安装 fork」: 默认目录 = ~/llama.cpp-<org 小写>(从 URL 推导,
+    // 与官方源码编译的 ~/llama.cpp 默认位不撞车); 推不出 org 时兜底
+    static func defaultForkDir(url: String) -> String {
+        let u = url.trimmingCharacters(in: .whitespaces)
+        if let parsed = URL(string: u), let host = parsed.host, !host.isEmpty,
+           let org = parsed.path.split(separator: "/").first(where: { !$0.isEmpty }) {
+            return NSHomeDirectory() + "/llama.cpp-\(org.lowercased())"
+        }
+        return NSHomeDirectory() + "/llama.cpp-fork"
+    }
+
+    // URL 归一化: 去尾部斜杠和 .git 后缀, 供「同仓库」判定(用户粘贴的 URL
+    // 和 clone 时写进 origin 的只差在这些装饰上)
+    static func normalizeRepoUrl(_ s: String) -> String {
+        var t = s.trimmingCharacters(in: .whitespaces)
+        if t.hasSuffix(".git") { t.removeSubrange(t.index(t.endIndex, offsetBy: -4)..<t.endIndex) }
+        while t.hasSuffix("/") { t.removeLast() }
+        return t
+    }
+
+    // 「从 URL 安装 fork」按钮: 工具检查 → 目录三分支判定 → clone/复用 + 编译。
+    // URL 不做格式校验(H1 定案): 非空即放行, git 报错原文进日志
+    func beginForkInstall() {
+        let (clt, cmake) = app.checkBuildTools()
+        var missing: [String] = []
+        if !clt { missing.append("Xcode 命令行工具") }
+        if !cmake { missing.append("CMake") }
+        forkMissingTools = missing
+        guard missing.isEmpty else { return }
+        let url = forkUrl.trimmingCharacters(in: .whitespaces)
+        guard !url.isEmpty else { return }
+        let raw = forkDir.trimmingCharacters(in: .whitespaces)
+        let dir = (raw.isEmpty ? Self.defaultForkDir(url: url) : raw) as NSString
+        let d = dir.expandingTildeInPath
+        forkNote = ""
+        let fm = FileManager.default
+        if fm.fileExists(atPath: d + "/.git") {
+            // 同仓库判定: origin 归一化后一致; 无 origin(纯本地 init)按别的仓库处理
+            let origin = app.gitRemoteUrl(d)
+            guard Self.normalizeRepoUrl(origin) == Self.normalizeRepoUrl(url) else {
+                forkNote = T("该目录是另一个 git 仓库,不能往里 clone —— 换一个目录")
+                return
+            }
+            // 同仓库 ≠ 可直接编: 工作树为空 = clone 中断的半成品 → 自愈
+            // (fetch 补完 + checkout); 树完整 → pull --ff-only 对齐远端再编
+            let entries = (try? fm.contentsOfDirectory(atPath: d)) ?? []
+            let sync: UpgradeRunner.ForkSyncMode =
+                entries.filter { $0 != ".git" }.isEmpty ? .repair : .sync
+            app.forkRunner.installFork(url: url, dir: d, sync: sync) { [weak self] ok in
+                self?.finishForkInstall(ok: ok, dir: d)
+            }
+        } else if fm.fileExists(atPath: d) {
+            forkNote = T("目录已存在且不是 git 仓库 —— 换一个目录")
+        } else {
+            app.forkRunner.installFork(url: url, dir: d, sync: .clone) { [weak self] ok in
+                self?.finishForkInstall(ok: ok, dir: d)
+            }
+        }
+    }
+
+    // 流水线收尾: 成功 → 记入已录用列表(不切换) + 刷新 + G2 弹窗;
+    // 失败/取消 → 不记条目, 日志区已有红字
+    private func finishForkInstall(ok: Bool, dir: String) {
+        guard ok else { return }
+        app.recordForkEntry(dir)
+        if dir == app.settings.src {
+            // 编的正是当前生效目录: built 锚点同步到新 head, 否则升级 tab
+            // 会误亮「代码已更新」横幅
+            app.recordBuiltCommit()
+            app.settings.save()
+        }
+        refresh()
+        let a = NSAlert()
+        if dir == app.settings.src {
+            a.messageText = T("编译成功")
+            a.informativeText = T("该目录是当前生效版本,router 还在跑旧二进制,重启后新代码才生效。")
+            a.addButton(withTitle: T("立即重启 router"))
+            a.addButton(withTitle: T("稍后"))
+            if a.runModal() == .alertFirstButtonReturn {
+                app.restartRouterNow()
+            }
+        } else {
+            a.messageText = T("编译成功")
+            a.informativeText = TF("已加入已录用列表:%@\n点击列表中该行即可接入(会重启 router)。", dir)
+            a.addButton(withTitle: T("好"))
+            a.runModal()
+        }
+    }
+
     // 源码编译 is recommended; before running, verify the build tools the
     // app deliberately does NOT install for the user
     func beginSourceInstall() {
@@ -2673,9 +2877,13 @@ final class EnvPageModel: ObservableObject {
         return Self.displayName(path: app.settings.src, name: rec?.name ?? "")
     }
 
-    // 切换编译版 = 重启 router —— 有模型加载时先确认(与 restartRouter 同模式)
+    // 切换编译版 = 重启 router —— 无条件二次确认(2026-09: 原来只在有模型
+    // 加载时弹, 无模型时连点连切; 误点代价是整段停机, 多一次点击值得)。
+    // 无模型时文案不提卸载
     private func confirmRouterRestart(_ what: String) -> Bool {
-        guard !app.loadedNames.isEmpty else { return true }
+        if app.loadedNames.isEmpty {
+            return confirmAlert(T("重启 router"), TF("%@。确认继续吗?", what), ok: T("重启"))
+        }
         return confirmAlert(T("重启 router"), TF("%@。重启会卸载所有已加载的模型,确认继续吗?", what), ok: T("重启"))
     }
 
@@ -2683,17 +2891,35 @@ final class EnvPageModel: ObservableObject {
         let dir = adoptDirPath.trimmingCharacters(in: .whitespaces)
         guard !dir.isEmpty else { return }
         guard confirmRouterRestart(T("正在接入其他编译版")) else { return }
-        if let err = app.adoptSourceDir(dir, name: adoptName.trimmingCharacters(in: .whitespaces)) {
+        if let err = app.adoptSourceDir(dir, name: "") {
             adoptNotes.append(TF("接入失败:\n%@", err))
         } else {
             refresh()   // 刷新环境/已录用列表; adoptNotes 是 append-only, 顺序无约束
             adoptNotes.append(TF("已接入 %@,router 已重启", dir))
             adoptDirPath = ""
-            adoptName = ""
         }
     }
 
+    // 改名(行尾 ✎): NSAlert + NSTextField 模态(全 app 模态语言一致, 零
+    // SwiftUI 焦点风险); 预填全选, 弹窗起来后把 first responder 给输入框
+    func rename(_ row: AdoptRow) {
+        let a = NSAlert()
+        a.messageText = T("改名")
+        a.informativeText = T("显示名(留空 = 取目录名)。")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.stringValue = row.name
+        a.accessoryView = field
+        a.addButton(withTitle: T("好"))
+        a.addButton(withTitle: T("取消"))
+        field.selectText(nil)
+        DispatchQueue.main.async { a.window.makeFirstResponder(field) }
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        app.renameSourceEntry(path: row.path, name: field.stringValue)
+        refresh()
+    }
+
     func switchTo(_ row: AdoptRow) {
+        guard !row.current else { return }   // 当前行点击 no-op(颜色不再靠 .disabled 表达)
         let what = row.official ? T("正在切换回官方版") : T("正在接入其他编译版")
         guard confirmRouterRestart(what) else { return }
         if row.official {
@@ -2720,6 +2946,8 @@ final class EnvPageModel: ObservableObject {
 struct EnvPage: View {
     let app: AppDelegate
     @ObservedObject var runner: UpgradeRunner
+    @ObservedObject var forkRunner: UpgradeRunner   // fork 安装卡专用; 必须直接观察,
+                                                    // 否则日志/按钮不随其 @Published 重绘
     @ObservedObject var l10n = L10n.shared   // re-render on language switch
     @ObservedObject var pipelineState = PipelineState.shared   // 跨页互斥: 任一流水线在跑就禁用本页更新按钮
     @ObservedObject var m: EnvPageModel   // app 主体保管(app.envModel), 切页不销毁
@@ -2727,6 +2955,7 @@ struct EnvPage: View {
     init(app: AppDelegate, runner: UpgradeRunner) {
         self.app = app
         self.runner = runner
+        _forkRunner = ObservedObject(wrappedValue: app.forkRunner)
         _m = ObservedObject(wrappedValue: app.envModel)
     }
 
@@ -2801,7 +3030,7 @@ struct EnvPage: View {
                     // 点「源码编译」后缺工具: 按钮会 disabled, 警告卡必须在这里
                     // 渲染(源码版 tab 内的两张卡只覆盖已装好源码版的状态)
                     if !m.missingTools.isEmpty {
-                        toolsWarning
+                        toolsWarning(m.missingTools) { m.beginSourceInstall() }
                     }
                     HStack(spacing: 8) {
                         Text(T("目录")).font(.system(size: 12)).foregroundStyle(.secondary)
@@ -2821,7 +3050,7 @@ struct EnvPage: View {
                 if runner.running {
                     Button(T("取消")) { runner.cancel() }
                 }
-                finishedLine
+                finishedLineView(runner)
                 Divider()
                 TailLogView(lines: runner.lines)
             }
@@ -2841,6 +3070,18 @@ struct EnvPage: View {
             VStack(spacing: 0) {
                 ForEach(rows, id: \.path) { row in
                     HStack(spacing: 4) {
+                        // 改名按钮在名字左侧(行首): 行尾和 ✕ 挤一起太小,
+                        // 真机反馈「根本看不出来」。GhostIcon 幽灵语言(与模型页
+                        // 📌 已置顶态同款): 系统 accent 常亮(动态色自动适配
+                        // 深浅色), 悬停圆形点亮; 图标 square.and.pencil 是
+                        // 六个候选(桌面 rename-icons.png)里用户选定的
+                        if !row.official {
+                            GhostIcon(symbol: "square.and.pencil", size: 13,
+                                      tint: Color.accentColor,
+                                      hoverTint: Color.accentColor) {
+                                m.rename(row)
+                            }
+                        }
                         Button {
                             m.switchTo(row)
                         } label: {
@@ -2879,7 +3120,10 @@ struct EnvPage: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .disabled(row.current || row.missing)
+                        // 当前行不发灰(旧 .disabled(row.current) 把生效行渲成
+                        // 灰色, 与「使用中」语义相反, 2026-09 真机反馈): 只禁
+                        // 缺失行; 当前行点击 no-op(见 switchTo)
+                        .disabled(row.missing)
                         .opacity(row.missing ? 0.5 : 1)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
@@ -2936,7 +3180,7 @@ struct EnvPage: View {
                     pipelineArea
                 }
                 if !m.missingTools.isEmpty {
-                    toolsWarning
+                    toolsWarning(m.missingTools) { m.beginSourceInstall() }
                 }
             }
             .padding(.vertical, 14)
@@ -2945,6 +3189,7 @@ struct EnvPage: View {
             .background(CardChrome(accent: UIStyle.hues[0]).padding(.horizontal, -50))
         case .adopt:
             VStack(alignment: .leading, spacing: 8) {
+                forkInstallCard
                 Text(T("接入一个你自己 clone + 编译过的 llama.cpp 目录(自动检测覆盖不了任意路径的存量安装)。接入后升级/分支管理都指向它。"))
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -2953,11 +3198,6 @@ struct EnvPage: View {
                     TextField(T("目录路径"), text: $m.adoptDirPath)
                         .font(.system(size: 11, design: .monospaced))
                         .textFieldStyle(.plain)
-                        .nativeFieldBox()
-                    TextField(T("名字(留空 = 取目录名)"), text: $m.adoptName)
-                        .font(.system(size: 11))
-                        .textFieldStyle(.plain)
-                        .frame(maxWidth: 180)
                         .nativeFieldBox()
                     Button(T("浏览…")) { pickDir(into: $m.adoptDirPath) }
                         .controlSize(.small)
@@ -3082,7 +3322,7 @@ struct EnvPage: View {
                     pipelineArea
                 }
                 if !m.missingTools.isEmpty {
-                    toolsWarning
+                    toolsWarning(m.missingTools) { m.beginSourceInstall() }
                 }
             }
             .padding(.vertical, 14)
@@ -3094,18 +3334,74 @@ struct EnvPage: View {
     @ViewBuilder
     private var pipelineArea: some View {
         TailLogView(lines: runner.lines)
-        finishedLine
+        finishedLineView(runner)
         if runner.running {
             Button(T("取消")) { runner.cancel() }
         }
     }
 
-    // 流水线完成/失败提示(绿=成功, 红=失败/未就绪)
+    // 接入 tab 顶部: 从 URL 克隆并编译第三方 fork。产物只进已录用列表,
+    // 接入(切 src/bin + 重启)仍由用户点列表行触发(2026-09 定案)
     @ViewBuilder
-    private var finishedLine: some View {
-        if let f = runner.finished {
+    private var forkInstallCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(T("从 URL 克隆并编译第三方 fork"))
+                .font(.system(size: 13, weight: .semibold))
+            Text(T("适用于需要特殊 kernel 的 llama.cpp 分支(官方二进制跑不了对应模型)。编译完成后进入下方已录用列表,何时接入由你决定。"))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                TextField(T("仓库 URL"), text: $m.forkUrl)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textFieldStyle(.plain)
+                    .nativeFieldBox()
+                    .onChange(of: m.forkUrl) { m.forkUrlChanged() }
+                TextField(forkDirPlaceholder, text: $m.forkDir)
+                    .font(.system(size: 11, design: .monospaced))
+                    .textFieldStyle(.plain)
+                    .nativeFieldBox()
+                Button(T("浏览…")) { pickDir(into: $m.forkDir) }
+                    .controlSize(.small)
+            }
+            HStack(spacing: 8) {
+                Button(T("克隆并编译")) { m.beginForkInstall() }
+                    .disabled(forkRunner.running || pipelineState.busy
+                              || m.forkUrl.trimmingCharacters(in: .whitespaces).isEmpty
+                              || !m.forkMissingTools.isEmpty)
+                if forkRunner.running {
+                    Button(T("取消")) { forkRunner.cancel() }
+                }
+                Spacer()
+            }
+            if !m.forkMissingTools.isEmpty {
+                toolsWarning(m.forkMissingTools) { m.beginForkInstall() }
+            }
+            if !m.forkNote.isEmpty {
+                Text(m.forkNote)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            }
+            if forkRunner.running || !forkRunner.lines.isEmpty {
+                TailLogView(lines: forkRunner.lines)
+                finishedLineView(forkRunner)
+            }
+        }
+    }
+
+    // 目录框占位符 = 从 URL 推导的默认值(提交时空框也用它)
+    private var forkDirPlaceholder: String {
+        m.forkUrl.trimmingCharacters(in: .whitespaces).isEmpty
+            ? T("目录(留空 = 自动推导)")
+            : EnvPageModel.defaultForkDir(url: m.forkUrl)
+    }
+
+    // 流水线完成/失败提示(绿=成功, 红=失败/未就绪); 收 runner 参数是因为
+    // fork 安装卡用自己的 runner, 不能只读页级的 upgradeRunner
+    @ViewBuilder
+    private func finishedLineView(_ r: UpgradeRunner) -> some View {
+        if let f = r.finished {
             Text(f)
-                .foregroundStyle(runner.finishedOK ? .green : .red)
+                .foregroundStyle(r.finishedOK ? .green : .red)
                 .font(.callout)
         }
     }
@@ -3135,24 +3431,26 @@ struct EnvPage: View {
 
     // prominent notice for missing build tools; the app deliberately does
     // not install these — it points at the official instructions instead
-    private var toolsWarning: some View {
+    // 收 tools/restart 参数: 源码编译三处与 fork 安装卡共用同一张警告卡,
+    // 「我已装好,继续」各自回自己的入口
+    private func toolsWarning(_ tools: [String], restart: @escaping () -> Void) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             // tool names are internal ids (compared with contains elsewhere);
             // translate only at the display site
-            Text(TF("缺少编译工具:%@", m.missingTools.map { T($0) }.joined(separator: ", ")))
+            Text(TF("缺少编译工具:%@", tools.map { T($0) }.joined(separator: ", ")))
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.orange)
-            if m.missingTools.contains(T("Xcode 命令行工具")) {
+            if tools.contains(T("Xcode 命令行工具")) {
                 Text(T("• Xcode 命令行工具:终端执行 xcode-select --install 并按弹窗安装,或到 Mac App Store 搜索 Command Line Tools 安装"))
                     .font(.system(size: 11))
             }
-            if m.missingTools.contains("CMake") {
+            if tools.contains("CMake") {
                 Text(T("• CMake:官网 cmake.org/download 下载 macOS 安装包,或终端执行 brew install cmake"))
                     .font(.system(size: 11))
             }
             // re-check + start-if-ready: same action as 源码编译 (kapa P2-10)
             Button(T("我已装好,继续")) {
-                m.beginSourceInstall()
+                restart()
             }
         }
         .padding(10)
