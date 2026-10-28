@@ -46,6 +46,129 @@ final class ProxyState: ObservableObject {
     private init() { enabled = Settings.load().audioProxy }
 }
 
+// MARK: - GPU wired limit (实验性功能: iogpu.wired_limit_mb)
+
+// 开关 = 总闸:关掉 = 系统里那张开机任务不存在(卡片其余部分同时全灰置)。
+// 只有持久化一种生效方式(不做「本次临时生效」);提权只发生在保存/移除两个动作上。
+// 开机任务必须落在 /Library/LaunchDaemons:macOS 只在这个目录里以 root 身份、
+// 登录前执行开机任务(用户级 LaunchAgent 不是 root,写不动 sysctl;Corral 没有
+// 安装器,所以不能靠 app 包内的 LaunchAgents)。
+// 任务单内容就一条 sysctl 命令、不做重试 —— 实测本机启动日志(2026-10-04):
+// GPU kext 13:02:00 注册 iogpu.* 参数,launchd 13:02:14 才开始 spawn system 域
+// daemon,差 14 秒,不存在「参数尚未注册所以写空」的窗口(定案 Q4)。
+let GPU_DAEMON_LABEL = "com.penguinM.corral.iogpu"
+let GPU_DAEMON_PATH  = "/Library/LaunchDaemons/\(GPU_DAEMON_LABEL).plist"
+// 查来的值单独存这里,刻意不进 settings/app —— 那是用户会手编辑的文件(定案 X1)
+let GPU_PROBE_FILE   = SETTINGS_DIR + "/gpu-probe"
+
+final class GpuLimitState: ObservableObject {
+    static let shared = GpuLimitState()
+
+    @Published var on: Bool         // 开关位置 = 意图;没点保存不落盘、不碰系统
+    @Published var gb: String       // 数值框,单位 GiB,可带一位小数
+    @Published var savedOn = false  // 已落实的状态(= settings/app 里记的)
+    @Published var savedMB: Int?
+    @Published var currentMB: Int?  // 下面三格 = 上次查询的缓存(不自动查,定案 Q7)
+    @Published var daemonInstalled = false
+    @Published var memMB: Int?
+    @Published var checkedAt = ""
+
+    private init() {
+        let s = Settings.load()
+        savedOn = s.gpuLimit
+        savedMB = s.gpuLimitMB
+        on = s.gpuLimit
+        // 两阶段初始化限制:用局部变量,不能在这里读 self.savedMB
+        gb = s.gpuLimitMB.map(Self.gbText) ?? ""
+        // 物理内存是常量,启动读一次:硬上限校验必须有它,否则首次使用没有校验
+        memMB = Self.sysctlInt("hw.memsize").map { $0 / 1048576 }
+        if let text = try? String(contentsOfFile: GPU_PROBE_FILE, encoding: .utf8) {
+            for line in text.split(separator: "\n") {
+                let parts = line.split(separator: ":", maxSplits: 1)
+                guard parts.count == 2 else { continue }
+                let k = parts[0].trimmingCharacters(in: .whitespaces)
+                let v = parts[1].trimmingCharacters(in: .whitespaces)
+                if k == "current-mb", let n = Int(v) { currentMB = n }
+                if k == "mem-mb", let n = Int(v) { memMB = n }
+                if k == "daemon" { daemonInstalled = (v == "on") }
+                if k == "checked" { checkedAt = v }
+            }
+        }
+    }
+
+    static func gbText(_ mb: Int) -> String {
+        let d = Double(mb) / 1024.0
+        return d == d.rounded() ? String(Int(d)) : String(format: "%.1f", d)
+    }
+
+    // 输入 -> MB(sysctl 只吃整数 MB,一位小数换算后四舍五入,卡片显示换算后的真实值)。
+    // nil = 非法(空 / 非数字 / 0 / 负)。不设下限:填低值是用户的自由(定案 Q5)。
+    var inputMB: Int? {
+        let t = gb.trimmingCharacters(in: .whitespaces)
+        guard let d = Double(t), d > 0 else { return nil }
+        return Int((d * 1024).rounded())
+    }
+    var limitMB: Int? { memMB.map { $0 - 4 * 1024 } }   // 硬上限 = 物理内存 - 4 GiB
+    var overLimit: Bool {
+        guard let m = inputMB, let l = limitMB else { return false }
+        return m >= l
+    }
+    var targetMB: Int? { inputMB ?? savedMB }
+    var dirty: Bool { on != savedOn || targetMB != savedMB }
+    // 提交按钮何时亮:开关开 = 必须有合法数值才能装;开关关 = 只有「已装待卸」才需要提交
+    // (否则把开关拨回关之后没有任何入口能卸掉那张任务单)。
+    var canApply: Bool {
+        guard dirty, !overLimit else { return false }
+        if on { return targetMB != nil }
+        return savedOn
+    }
+
+    // 动作成功后才落实(mb = nil 表示数值不动,例如移除任务单后仍留着数值灰显)
+    func commit(on: Bool, mb: Int?) {
+        savedOn = on
+        if let mb { savedMB = mb }
+    }
+
+    func setProbe(current: Int?, installed: Bool, mem: Int?) {
+        currentMB = current
+        daemonInstalled = installed
+        if let mem { memMB = mem }
+        checkedAt = Self.stamp()
+        saveProbe()
+    }
+
+    func saveProbe() {
+        var out = ""
+        if let m = memMB { out += "mem-mb: \(m)\n" }
+        if let c = currentMB { out += "current-mb: \(c)\n" }
+        out += "daemon: \(daemonInstalled ? "on" : "off")\n"
+        if !checkedAt.isEmpty { out += "checked: \(checkedAt)\n" }
+        try? out.write(toFile: GPU_PROBE_FILE, atomically: true, encoding: .utf8)
+    }
+
+    private static func stamp() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: Date())
+    }
+
+    // 无特权读一个 sysctl 整数;读不到(参数不存在等)返回 nil
+    static func sysctlInt(_ name: String) -> Int? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/sbin/sysctl")
+        p.arguments = ["-n", name]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        // 先排空再 wait(v2.0 检查 P1-4 的管道纪律)
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        return Int(String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
+    }
+}
+
 // MARK: - Settings
 
 // 我已有其他编译版 tab 的已录用条目: 目录 + 可选显示名
@@ -70,6 +193,8 @@ struct Settings {
     var pinnedEndpoints: [String] = []   // 设置页 API 端点「置顶」(应用级,与模型无关)
     var lang = ""          // UI language: "zh" / "en"; empty = follow system (see L10n)
     var audioProxy = false // 实验性功能: 音频转码代理开关(默认关)
+    var gpuLimit = false        // 实验性功能: GPU 内存上限总闸(开 = 系统里有那张开机任务)
+    var gpuLimitMB: Int? = nil  // 上限,单位 MB(sysctl 吃 MB,UI 显示 GiB)
 
     static func load() -> Settings {
         var s = Settings()
@@ -96,6 +221,8 @@ struct Settings {
             }
             if k == "lang", !v.isEmpty { s.lang = v }
             if k == "audio-proxy" { s.audioProxy = (v == "on") }
+            if k == "gpu-wired-limit" { s.gpuLimit = (v == "on") }
+            if k == "gpu-wired-limit-mb", let n = Int(v), n > 0 { s.gpuLimitMB = n }
             if k == "managed-src", !v.isEmpty { s.managedSrc = v }
             if k == "sources" {
                 // one entry per line: "<path>::<name>" (name may be empty).
@@ -122,6 +249,8 @@ struct Settings {
         if !pinnedEndpoints.isEmpty { out += "pinned-endpoints: \(pinnedEndpoints.joined(separator: ", "))\n" }
         if !lang.isEmpty { out += "lang: \(lang)\n" }
         out += "audio-proxy: \(audioProxy ? "on" : "off")\n"
+        out += "gpu-wired-limit: \(gpuLimit ? "on" : "off")\n"
+        if let n = gpuLimitMB { out += "gpu-wired-limit-mb: \(n)\n" }
         if !managedSrc.isEmpty { out += "managed-src: \(managedSrc)\n" }
         for e in sources { out += "sources: \(e.path)\(e.name.isEmpty ? "" : "::" + e.name)\n" }
         try? out.write(toFile: SETTINGS_FILE, atomically: true, encoding: .utf8)
@@ -174,6 +303,15 @@ struct ModelEntry {
         guard let p = ggufPath else { return false }
         return !FileManager.default.fileExists(atPath: p)
     }
+}
+
+// 模态徽章: 🎙 = 能收音频 / 🖼 = 能收图片。数据 = 3s 刷新缓存的 /models
+// input_modalities(同「文件缺失」的派生标记路子,不持久化,router 停 = 空)
+func modalityBadge(_ input: Set<String>) -> String {
+    var s = ""
+    if input.contains("audio") { s += "🎙" }
+    if input.contains("image") { s += "🖼" }
+    return s.isEmpty ? "" : " " + s
 }
 
 func loadModelEntries() -> [ModelEntry] {
@@ -603,7 +741,8 @@ final class RouterProc {
 
 // MARK: - Router HTTP API
 
-struct ModelInfo { let id: String; let status: String; let failed: Bool; let exitCode: Int }
+struct ModelInfo { let id: String; let status: String; let failed: Bool; let exitCode: Int
+                  let inputModalities: [String] }
 
 func isRunningStatus(_ s: String) -> Bool {
     return s == "loaded" || s == "loading" || s == "sleeping"
@@ -670,10 +809,14 @@ final class RouterAPI {
             let st = m["status"] as? [String: Any]
             // failed/exit_code: 模型子进程退出后 router 留下的唯一失败信号
             // (load 是异步的,HTTP 恒 200)
+            // architecture: PR #29987 起 /models 每个模型带模态(离线计算,
+            // 未加载也报); 只取 input, 徽章 = 模型「能吃」什么
+            let arch = m["architecture"] as? [String: Any]
             return ModelInfo(id: id,
                              status: st?["value"] as? String ?? "unknown",
                              failed: st?["failed"] as? Bool ?? false,
-                             exitCode: st?["exit_code"] as? Int ?? 0)
+                             exitCode: st?["exit_code"] as? Int ?? 0,
+                             inputModalities: arch?["input_modalities"] as? [String] ?? [])
         }
     }
 
@@ -771,6 +914,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // failed 标记发现(见 checkPendingLoads);router 停/重启时必须随
     // loadedNames 一起清,防止对没点过的加载弹幽灵窗
     var pendingLoads = Set<String>()
+    // 模型 id → input_modalities: 3s 刷新的派生缓存,喂状态栏菜单的 🎙/🖼 徽章
+    // (PR #29987)。router 重启后由下次刷新自愈,不随 pendingLoads 清
+    var modelInputModalities: [String: Set<String>] = [:]
     var routerDead = false
     // true once a spawn succeeded; gates the health-check recovery so a
     // failed start (already handled by startRouter's alert) doesn't also
@@ -981,7 +1127,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let entries = loadModelEntries()
         for m in entries {
             let missing = m.fileMissing
-            let item = NSMenuItem(title: missing ? m.label + T(" · ⚠️ 文件缺失") : m.label, action: nil, keyEquivalent: "")
+            let item = NSMenuItem(title: m.label + modalityBadge(modelInputModalities[m.id] ?? [])
+                + (missing ? T(" · ⚠️ 文件缺失") : ""), action: nil, keyEquivalent: "")
             item.state = loadedNames.contains(m.id) ? .on : .off
             let sub = NSMenu()
             let act: NSMenuItem
@@ -1495,6 +1642,127 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         startRouter()
     }
 
+    // MARK: 实验性功能: GPU 内存上限(iogpu.wired_limit_mb)
+    // 定案:不自动查询(只有「查询」和「保存并应用」成功时读系统);提权只在保存/
+    // 移除两个动作上;失败全退回原状;授权未完成(取消/密码错)保持静默 —— 系统自己
+    // 已经给过提示,Corral 不重复。
+
+    func gpuProbe() {
+        let g = GpuLimitState.shared
+        g.setProbe(current: GpuLimitState.sysctlInt("iogpu.wired_limit_mb"),
+                   installed: FileManager.default.fileExists(atPath: GPU_DAEMON_PATH),
+                   mem: GpuLimitState.sysctlInt("hw.memsize").map { $0 / 1048576 })
+    }
+
+    // 卡片上只有这一个提交按钮:开关开 = 装/改开机任务并立即生效,关 = 删掉它
+    func gpuSave() {
+        if GpuLimitState.shared.on { gpuApply() } else { gpuRemove() }
+    }
+
+    private func gpuApply() {
+        let g = GpuLimitState.shared
+        guard let mb = g.targetMB, mb > 0 else { return }   // 按钮已灰置,这里兜底
+        if let l = g.limitMB, mb >= l { return }
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("corral-iogpu.plist")
+        do { try gpuDaemonPlist(mb).write(to: tmp, atomically: true, encoding: .utf8) } catch {
+            appendLogLine("[gpu-limit] could not stage the boot task: \(error.localizedDescription)")
+            return
+        }
+        // 一条特权 shell 调用做完全部动作(不弹两次密码框):先摘旧任务(不存在则
+        // 报错也无所调,已 2>/dev/null)→ 拷入 + root:wheel/644 → bootstrap → 当场生效一次
+        let script = "launchctl bootout system/\(GPU_DAEMON_LABEL) 2>/dev/null; "
+            + "cp '\(tmp.path)' '\(GPU_DAEMON_PATH)' && chown root:wheel '\(GPU_DAEMON_PATH)' "
+            + "&& chmod 644 '\(GPU_DAEMON_PATH)' && launchctl bootstrap system '\(GPU_DAEMON_PATH)' "
+            + "&& /usr/sbin/sysctl -w iogpu.wired_limit_mb=\(mb)"
+        switch gpuRunPrivileged(script) {
+        case .ok:
+            settings.gpuLimit = true
+            settings.gpuLimitMB = mb
+            settings.save()
+            g.commit(on: true, mb: mb)
+            gpuProbe()
+            appendLogLine("[gpu-limit] boot task installed, wired limit \(mb) MB (applied now)")
+        case .canceled:
+            // 什么都没发生:不写配置、不弹窗、不记日志。但开关必须弹回落盘状态 ——
+            // 否则会出现「显示已关、其实任务单还在」这种定案禁止的状态。
+            // 数值草稿保留(同模型表单:保存失败不丢草稿)。
+            g.on = g.savedOn
+        case .failed(let msg):
+            g.on = g.savedOn
+            appendLogLine("[gpu-limit] apply failed: \(msg)")
+            showAlert(T("GPU 内存上限"), msg)
+        }
+    }
+
+    private func gpuRemove() {
+        let script = "launchctl bootout system/\(GPU_DAEMON_LABEL) 2>/dev/null; rm -f '\(GPU_DAEMON_PATH)'"
+        switch gpuRunPrivileged(script) {
+        case .ok:
+            settings.gpuLimit = false
+            settings.save()
+            GpuLimitState.shared.commit(on: false, mb: nil)   // 数值留着(灰显),只是不再落实
+            gpuProbe()
+            appendLogLine("[gpu-limit] boot task removed")
+            showAlert(T("GPU 内存上限"), T("Corral 不再执行这条命令。本次开机的上限仍然有效,重启后由系统决定。"))
+        case .canceled:
+            GpuLimitState.shared.on = GpuLimitState.shared.savedOn   // 同 apply:开关弹回真实状态
+        case .failed(let msg):
+            GpuLimitState.shared.on = GpuLimitState.shared.savedOn
+            appendLogLine("[gpu-limit] remove failed: \(msg)")
+            showAlert(T("GPU 内存上限"), msg)
+        }
+    }
+
+    private enum GpuPriv { case ok, canceled, failed(String) }
+
+    // 系统原生授权框(osascript 的 with administrator privileges):纯 Apple API,
+    // 不靠免密 sudoers、不多养 helper 进程。失败时 AppleScript 把 shell 的 stderr
+    // 原文带回来 —— 那就是要弹给用户看的「系统原话」(定案 Q15)。
+    private func gpuRunPrivileged(_ script: String) -> GpuPriv {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        let prompt = T("Corral 需要管理员权限来设置 GPU 内存上限")
+        p.arguments = ["-e", "do shell script " + Self.asQuote(script)
+            + " with administrator privileges with prompt " + Self.asQuote(prompt)]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return .failed(error.localizedDescription) }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()   // 排空再 wait
+        p.waitUntilExit()
+        guard p.terminationStatus != 0 else { return .ok }
+        var msg = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        // 用户在授权框里按取消 = 什么都没发生(err -128),保持静默
+        if msg.localizedCaseInsensitiveContains("canceled") || msg.contains("(-128)") { return .canceled }
+        if msg.isEmpty { msg = T("授权未完成") }
+        return .failed(msg)
+    }
+
+    // AppleScript 字符串字面量转义(里面的 shell 路径全部是常量 + 已校验的整数)
+    private static func asQuote(_ s: String) -> String {
+        "\"" + s.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
+    private func gpuDaemonPlist(_ mb: Int) -> String {
+        """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key><string>\(GPU_DAEMON_LABEL)</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>/usr/sbin/sysctl</string>
+                <string>-w</string>
+                <string>iogpu.wired_limit_mb=\(mb)</string>
+            </array>
+            <key>RunAtLoad</key><true/>
+        </dict>
+        </plist>
+        """
+    }
+
     var currentPublicPort: Int { settings.port ?? 8080 }
     // 本机回环地址:空/通配(0.0.0.0、::)时 router 绑在回环或全接口,
     // 用 127.0.0.1 拨即可;具体地址(局域网 IP 等)原样拨(app 与
@@ -1536,7 +1804,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 guard let list else { return }
                 self.loadedNames = Set(list.filter { isRunningStatus($0.status) }.map { $0.id })
+                self.modelInputModalities = Dictionary(list.map { ($0.id, Set($0.inputModalities)) },
+                                                       uniquingKeysWith: { $1 })
                 self.dashboard.model.loadedIDs = self.loadedNames
+                self.dashboard.model.inputModalities = self.modelInputModalities
                 self.dashboard.model.modelEntries = loadModelEntries()
                 self.dashboard.model.routerReady = healthy
                 self.updateIcon()

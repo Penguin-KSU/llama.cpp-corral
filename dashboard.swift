@@ -57,14 +57,14 @@ private let KV_TYPES: [String] = ["f32", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl
 let PARAMS: [Param] = [
     // ---- group 1: context & cache ----
     P("ctx-size", .num, "0 (从模型读取)", "上下文窗口大小(token 数)", 1),
-    P("parallel", .num, "-1 (auto)", "并行 slot 数(auto = 按内存自动)", 1),
+    P("parallel", .num, "-1 (auto)", "并行 slot 数(auto = 4;填具体值时统一 KV 缓存默认关闭)", 1),
     P("batch-size", .num, "2048", "批处理大小(预填充一次处理的 token 数)", 1),
     P("ubatch-size", .num, "512", "微批大小(把 batch 再细分, 省内存)", 1),
     P("keep", .num, "0", "从上下文开头保留的 token 数", 1),
     P("n-predict", .num, "-1 (无限)", "单次请求最多生成的 token 数", 1),
     P("swa-full", .bool, "off", "滑动窗口模型按全窗口计算(更费内存)", 1, oneWay: true),
-    P("kv-unified", .bool, "off", "所有序列共用一块 KV 缓存(slots 为 auto 时自动启用)", 1),
-    P("kv-unified-per-slot", .num, "未设置", "KV 缓存统一模式(每 slot)", 1),
+    P("kv-unified", .bool, "on when slots=auto", "所有序列公用一块 KV 缓存(parallel 为 auto 时强制 on,off 无效)", 1),
+    P("kv-unified-per-slot", .num, "未设置", "每个 slot 的上下文 token 上限(未设 ctx-size 时 KV 池 = slot 数 × 此值)", 1),
     P("ctx-checkpoints", .num, "32", "上下文检查点数量(供缓存复用)", 1),
     P("checkpoint-min-step", .num, "8192", "检查点之间的最小步长(token 数)", 1),
     P("cache-ram", .num, "8192", "提示词缓存的 token 上限", 1),
@@ -119,6 +119,7 @@ let PARAMS: [Param] = [
     P("override-tensor", .text, "", "指定张量强制用某设备计算", 2),
     P("cpu-moe", .bool, "off", "MoE 专家层留在 CPU 计算", 2, oneWay: true),
     P("n-cpu-moe", .num, "默认", "留在 CPU 的 MoE 层数", 2),
+    P("moe-cache-mib", .num, "默认", "留在 CPU 的 MoE 专家的 GPU 缓存(MiB,实验性)", 2),
     P("n-cpu-ffn", .num, "默认", "留在 CPU 的 FFN 层数", 2),
     P("check-tensors", .bool, "off", "启动时校验张量完整性", 2, oneWay: true),
     P("override-kv", .text, "", "指定 KV 缓存的存储设备", 2),
@@ -204,6 +205,7 @@ let PARAMS: [Param] = [
     P("metrics", .bool, "off", "启用 /metrics 指标端点", 5, oneWay: true),
     P("props", .bool, "off", "启用 /props 端点", 5, oneWay: true),
     P("slots", .bool, "on", "多 slot 并发模式", 5),
+    P("models-memory-margin", .num, "0", "router: 每设备预留空闲显存(MiB),装不下新模型时自动卸载最久未用的模型", 5),
     P("media-path", .path, "disabled", "媒体文件保存目录", 5),
     P("ui", .bool, "on (Web UI)", "启用内置 Web 界面", 5),
     P("tools", .text, "无 (all = 全部)", "启用的工具列表", 5),
@@ -216,8 +218,10 @@ let PARAMS: [Param] = [
     P("spec-draft-hf", .text, "", "从 Hugging Face 下载草稿模型", 5),
     P("spec-draft-n-max", .num, "3", "投机草稿最大长度", 5),
     P("spec-draft-n-min", .num, "0", "投机草稿最小长度", 5),
+    P("spec-draft-n-ubatch", .num, "0 (同 n-ubatch)", "投机草稿物理批次上限(调小省一点显存,不影响抢答速度)", 5),
     P("spec-draft-p-split", .num, "0.10", "投机解码分裂概率", 5),
     P("spec-draft-p-min", .num, "0.00", "投机解码最低接受概率", 5),
+    P("spec-draft-sampling", .choice(["greedy", "probabilistic"]), "greedy", "草稿采样方式: probabilistic 适配带 temperature 的对话", 5),
     P("spec-draft-type-k", .choice(KV_TYPES), "f16", "草稿模型 K 缓存类型", 5),
     P("spec-draft-type-v", .choice(KV_TYPES), "f16", "草稿模型 V 缓存类型", 5),
     P("spec-draft-threads", .num, "同 threads", "草稿模型 CPU 线程数", 5),
@@ -421,6 +425,8 @@ final class DashboardModel: ObservableObject {
     @Published var loadedIDs: Set<String> = []
     @Published var routerReady = false
     @Published var modelEntries: [ModelEntry] = []
+    // 模型 id → input_modalities: 主 3s 刷新喂入,下拉的 🎙/🖼 徽章数据源
+    @Published var inputModalities: [String: Set<String>] = [:]
     // One live form per mode: switching tabs / models just swaps which
     // form is shown — drafts survive all switches (2026-09 ruling). Only
     // 重置 / model deletion / a successful add-save / app restart discard
@@ -1621,6 +1627,8 @@ struct FormView: View {
     private var bottomBar: some View {
         HStack(spacing: 10) {
             Button(T("保存")) {
+                // 结束编辑态:光标消失,不用先点空白处(设置页确认按钮同款)
+                NSApp.keyWindow?.makeFirstResponder(nil)
                 // 已加载 + preset 内容有变 → router reload 会卸载该模型, 先告知
                 if case .edit(let id) = fm.mode, fm.isLoaded(), fm.presetDirty {
                     guard confirmAlert(T("保存"), TF("保存后 router 会卸载已加载的「%@」以应用新参数,确认继续吗?", id)) else { return }
@@ -1642,6 +1650,8 @@ struct FormView: View {
                 }
             }
             Button(fm.mode == .add ? T("重置为全局参数") : T("重置为默认")) {
+                // 结束编辑态:光标消失,不用先点空白处(设置页确认按钮同款)
+                NSApp.keyWindow?.makeFirstResponder(nil)
                 // 二次确认,防误触。添加页的重置 = 整体重播种(与全局
                 // 保存后的自动对齐同一动作),其余两页 = 清参数值
                 if fm.mode == .add {
@@ -1720,6 +1730,7 @@ struct ModelsPage: View {
                         Text(T("选择模型…")).tag(String?.none)
                         ForEach(dm.modelEntries, id: \.id) { m in
                             Text(m.label
+                                + modalityBadge(dm.inputModalities[m.id] ?? [])
                                 + (dm.loadedIDs.contains(m.id) ? T(" · 已加载") : "")
                                 + (m.fileMissing ? T(" · ⚠️ 文件缺失") : "")).tag(String?.some(m.id))
                         }
@@ -2772,6 +2783,11 @@ final class EnvPageModel: ObservableObject {
                 self.app.recordBuiltCommit()
                 self.app.settings.save()   // recordBuiltCommit only sets memory — persist it
                 self.needsRebuild = false   // built == head 刚成立
+                if tab == .upgrade {
+                    // pull 刚把代码拉平, 必须重查, 否则状态行继续显示升级前
+                    // 的「⬆️ N 个新提交」直到切页(2026-09 真机报修)
+                    self.checkSourceUpdate()
+                }
                 // the running router still has the old binary
                 self.app.restartRouterNow()
                 self.app.upgradeWaitInFlight = true   // 挂起健康恢复, 120s 等待自己掌舵(审计 B8)
@@ -4244,6 +4260,7 @@ struct ExperimentalPage: View {
     let app: AppDelegate
     @ObservedObject var l10n = L10n.shared   // re-render on language switch
     @ObservedObject var proxyState = ProxyState.shared   // re-render on switch toggle
+    @ObservedObject var gpu = GpuLimitState.shared       // re-render on GPU card changes
 
     var body: some View {
         ScrollView {
@@ -4251,7 +4268,7 @@ struct ExperimentalPage: View {
             VStack(alignment: .leading, spacing: 44) {
                 // 顶部总描述: 讲清"实验性"是什么(适用所有实验功能)
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(T("这里的功能是测试性质的:可能不稳定、可能有 bug、默认全部关闭,且只做了有限测试,不保证在所有场景下都正常工作。如果你不使用相关功能,请保持关闭;如果开启后出现问题,直接关闭对应功能即可恢复原有行为,不会损坏模型或数据。"))
+                    Text(T("这里的功能是测试性质的:可能不稳定、可能有 bug、默认全部关闭,且只做了有限测试,不保证在所有场景下都正常工作。如果你不使用相关功能,请保持关闭;如果开启后出现问题,直接关闭对应功能即可恢复原有行为(个别功能需要重启电脑才完全恢复),不会损坏模型或数据。"))
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                 }
@@ -4299,6 +4316,100 @@ struct ExperimentalPage: View {
                 .background(
                     // 方案 B: 实验功能 = 橙色卡片(警告色语义)
                     CardChrome(accent: UIStyle.hues[2])
+                        .padding(.horizontal, -50)
+                        .padding(.vertical, -14)
+                )
+
+                // 实验功能卡片: GPU 内存上限。开关 = 总闸:关着时除标题/说明/开关外
+                // 全灰置不可用;提权只发生在「保存并应用」那一下(定案 Q1/Q2/Q12)。
+                // 蓝色(内存/资源语义),与橙色音频卡区分(定案 P2/K2)。
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(T("GPU 内存上限")).font(.headline)
+                    Text(T("让更大的模型能完整常驻 GPU")).font(.system(size: 11)).foregroundStyle(.secondary)
+                    HStack {
+                        Text(T("开机自动设置"))
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { gpu.on },
+                            set: { gpu.on = $0 }))
+                            .appSwitch()
+                    }
+                    Group {
+                        HStack(spacing: 8) {
+                            Text(T("GPU 内存上限"))
+                            TextField(T("56"), text: $gpu.gb)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(gpu.gb.isEmpty ? Color.secondary : .primary)
+                                .textFieldStyle(.plain)
+                                .frame(width: 80)
+                                .nativeFieldBox()
+                            Text(T("GiB")).font(.system(size: 11)).foregroundStyle(.secondary)
+                            if let mg = gpu.memMB {
+                                // 超限实时反馈 + 按钮同步灰置(不「点了才弹错」,定案 F1)
+                                Text(gpu.overLimit
+                                     ? TF("必须小于 %d GiB", mg / 1024 - 4)
+                                     : TF("建议不超过 %d GiB,必须小于 %d GiB", mg / 1024 - 8, mg / 1024 - 4))
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(gpu.overLimit ? Color.red : Color.secondary)
+                            }
+                            Spacer()
+                        }
+                        HStack {
+                            Text(T("当前生效")).frame(width: 120, alignment: .leading)
+                            Text(gpu.currentMB.map { TF("%d MB", $0) } ?? T("未查询"))
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+                        HStack {
+                            Text(T("开机自动")).frame(width: 120, alignment: .leading)
+                            Text(T(gpu.daemonInstalled ? "已设置" : "未设置"))
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+                        HStack {
+                            Text(T("Corral 记录")).frame(width: 120, alignment: .leading)
+                            Text(gpu.savedMB.map { TF("%d MB", $0) } ?? T("未设置"))
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+                        HStack {
+                            Text(T("上次查询")).frame(width: 120, alignment: .leading)
+                            Text(gpu.checkedAt.isEmpty ? T("未查询") : gpu.checkedAt)
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+                        Text(T("修改后需把模型卸载再加载一次才会按新上限生效"))
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    .disabled(!gpu.on)
+                    .opacity(gpu.on ? 1 : 0.45)
+                    // 提交按钮行不进上面的 Group:开关拨回关、任务单还等着卸掉时,
+                    // 它是唯一还亮着的控件(canApply 自己判该不该亮)
+                    HStack {
+                        Spacer()
+                        if gpu.dirty && (gpu.on || gpu.savedOn) {
+                            // 与模型表单同款未落实指示(橙点 + 灰字)
+                            HStack(spacing: 5) {
+                                Circle().fill(Color.orange).frame(width: 7, height: 7)
+                                Text(T("有未保存的修改")).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        Button(T("查询")) { app.gpuProbe() }
+                            .disabled(!gpu.on)
+                        Button(T("保存并应用")) {
+                            // 结束编辑态:光标消失(设置页确认按钮同款)
+                            NSApp.keyWindow?.makeFirstResponder(nil)
+                            app.gpuSave()
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!gpu.canApply)
+                    }
+                    .opacity(gpu.on || gpu.canApply ? 1 : 0.45)
+                    Text(T("为什么有这个功能:llama.cpp 在 Apple Silicon 上要把模型数据锁进内存给 GPU 用,系统默认给的上限偏低,大模型往往加载到一半失败或退回普通内存、速度明显下降。本功能替你执行 sysctl -w iogpu.wired_limit_mb=…,并在每次开机时自动执行一次。"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                    Text(T("风险:锁给 GPU 的内存不能换出、直接占用物理内存。设得太高会和系统抢内存,可能导致卡顿甚至卡死。"))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .background(
+                    CardChrome(accent: UIStyle.hues[0])
                         .padding(.horizontal, -50)
                         .padding(.vertical, -14)
                 )

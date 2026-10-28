@@ -25,6 +25,12 @@ no more typing the same commands every time.
   dictation apps recording WebM/Opus (e.g. OpenWhispr) use llama.cpp's
   transcription API, which only reads WAV/MP3/FLAC — toggle it on the
   dashboard's Experimental page (requires ffmpeg: `brew install ffmpeg`)
+- Experimental (off by default): a **GPU memory limit** for Apple Silicon — raises
+  the system's cap on memory locked for the GPU (`iogpu.wired_limit_mb`) so large
+  models can stay fully in GPU memory instead of failing halfway or spilling to
+  ordinary memory, and re-applies it automatically at every boot. Toggle it on
+  the same Experimental page; turning it on asks for your password once and
+  installs a boot task that lives until you turn the feature off
 - Optional start-at-login
 
 ## Zero intrusion into llama.cpp
@@ -38,9 +44,13 @@ models over the HTTP API. All of its own data lives in its own data directory
 
 The app itself is light: a single binary, zero third-party dependencies, no
 background services, and it listens on no port of its own (the port belongs to
-the llama.cpp router) — the single exception is the opt-in experimental
-audio-transcoding proxy, which fronts that port while enabled and moves the
-router to an internal one.
+the llama.cpp router). The two opt-in experimental features are the only
+exceptions, and both exist only while they are switched on: the
+audio-transcoding proxy fronts that port (the router moves to an internal one),
+and the GPU memory limit installs one boot task
+(`/Library/LaunchDaemons/com.penguinM.corral.iogpu.plist`) whose entire content
+is a single `sysctl -w iogpu.wired_limit_mb=…`; turning the feature off removes
+it. Neither writes anything into llama.cpp's directories.
 
 **Uninstall**: quit the app → delete `Corral.app` → delete
 `~/Library/Application Support/Corral/` (skip this step to keep your configs).
@@ -65,6 +75,8 @@ cd llama.cpp-corral
   `/path/to/llama.cpp/build/bin`) and port on the Settings page.
 - (only for the experimental audio-transcoding feature) ffmpeg:
   `brew install ffmpeg`
+- (only for the experimental GPU memory limit) an Apple Silicon Mac — that
+  sysctl knob belongs to Apple's GPU driver and does not exist elsewhere
 
 ## Usage
 
@@ -115,7 +127,7 @@ All user data lives in the standard macOS location (created on first launch):
 ```
 ~/Library/Application Support/Corral/
 ├── config/           model parameter files (.llm)
-├── settings/         app settings (bin path, port, pinned endpoints, language, global param template)
+├── settings/         app settings (bin path, port, pinned endpoints, language, global param template) + GPU-limit probe cache
 └── logs/             router log
 ```
 

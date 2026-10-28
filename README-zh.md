@@ -20,6 +20,10 @@ router(`llama-server serve`,官方预编译版或自编译版均可),
 - 实验性功能(默认关闭):音频转码代理 —— 让录 WebM/Opus 的听写软件
   (如 OpenWhispr)能用上 llama.cpp 的转写 API(它只认 WAV/MP3/FLAC);
   控制面板「实验性功能」页开关,需 ffmpeg(`brew install ffmpeg`)
+- 实验性功能(默认关闭):**GPU 内存上限**(Apple Silicon)—— 抬高系统给 GPU
+  锁定内存的上限(`iogpu.wired_limit_mb`),让大模型能完整常驻 GPU,而不是加载到
+  一半失败或退回普通内存,并在每次开机自动重新设上;同一个实验页开关,开启时弹一次
+  密码并装上一个开机任务,关掉该功能即删除
 - 开机启动(可选)
 
 ## 对 llama.cpp 零侵入
@@ -30,8 +34,11 @@ Corral **从不修改 llama.cpp 的任何文件** —— 不写进源码目录�
 数据目录里(见下)。
 
 app 本身也很轻:单一二进制、零第三方依赖、无后台服务、不监听任何端口
-(端口是 llama.cpp router 的;唯一例外是可选开启的实验性音频转码代理,
-开启时它顶在该端口前、router 退到内部端口)。
+(端口是 llama.cpp router 的)。两个可选开启的实验功能是唯二的例外,而且它们只在
+开着的时候存在:音频转码代理顶在该端口前(router 退到内部端口);GPU 内存上限会装
+一个开机任务(`/Library/LaunchDaemons/com.penguinM.corral.iogpu.plist`),内容就一条
+`sysctl -w iogpu.wired_limit_mb=…`,关掉该功能即删除。两者都不会往 llama.cpp 的
+目录里写任何东西。
 
 **卸载**:退出 app → 删除 `Corral.app` → 删除
 `~/Library/Application Support/Corral/`(想保留配置就不删这一步)。
@@ -53,6 +60,8 @@ cd llama.cpp-corral
   已有其他位置的编译版可在该页「接入」。首次使用请在「设置」页确认
   `bin` 目录(如 `/path/to/llama.cpp/build/bin`)和端口。
 - (仅实验性音频转码功能需要)ffmpeg:`brew install ffmpeg`
+- (仅实验性 GPU 内存上限功能需要)Apple Silicon 机器 —— 那个 sysctl 参数属于 Apple
+  显卡驱动,其他地方不存在
 
 ## 使用
 
@@ -98,7 +107,7 @@ top-p              = 0.95
 ```
 ~/Library/Application Support/Corral/
 ├── config/           模型参数文件(.llm)
-├── settings/         应用设置(bin 路径、端口、端点置顶、语言、全局参数模板)
+├── settings/         应用设置(bin 路径、端口、端点置顶、语言、全局参数模板)+ GPU 上限查询缓存
 └── logs/             router 日志
 ```
 
